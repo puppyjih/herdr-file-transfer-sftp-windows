@@ -17,3 +17,16 @@ Icons in mods/files-transfer/icons/ come from Material Icon Theme
 Menu and chevron glyphs come from Lucide (https://lucide.dev), ISC.
 finder.svg and spinner.svg are copied from the Herdr app's workspace-chrome
 mod (Apache-2.0).
+
+Windows adaptation (2026-11-17): Windows Explorer clipboard/paste and Ctrl+V,
+Explorer reveal, Recycle Bin, native PowerShell filesystem operations, detached
+Windows transfers, atomic no-overwrite publication, remote Windows filesystem
+helper, normalized paths, Windows image metadata, and a non-overwriting Windows
+installer that clones the active layout. The module is named files-transfer-windows.
+Original source: https://github.com/vladimiryakimenko/herdr-files-transfer
+Upstream baseline: 28f84ddd0b72704011740a428cf722ddf455648c.
+Original copyrights, LICENSE and third-party license files are retained.
+
+Explorer additions (2026-11-17): folder entry/back/up navigation, terminal-folder reset, refresh toolbar, modification timestamps and persistent name/date ordering.
+
+Follow-mode additions (2026-11-17): default-on terminal tracking, explicit ON/OFF toolbar state, manual-navigation pinning of folder and machine, and tracking resumption.

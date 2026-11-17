@@ -1,80 +1,89 @@
-# Files Transfer for Herdr
+# herdr-file-transfer-sftp-windows
 
-**Herdr's Files panel with file transfer.** Right-click a file or folder to download it to your Mac, paste files copied in Finder to upload them, create, rename, move to the Trash or delete, or copy a path. It works the same on this computer and on remote machines your spaces run on over ssh. Files and folders show VS Code's colored icons.
+Windows file-transfer mod for Herdr. Uses OpenSSH scp (SFTP by default with modern OpenSSH).
 
-![Files Transfer menu](preview.png)
+Windows adaptation of [Files Transfer by vladimiryakimenko](https://github.com/vladimiryakimenko/herdr-files-transfer), based on File Icons and Herdr's built-in Files panel. Modified 2026-11-17; see NOTICE. Not an official Herdr release.
 
-A mod for the [Herdr](https://herdr.dev) desktop app. It replaces the shipped Files panel.
+## What it adds
 
-## What it does
+- Explorer-style folder navigation: click a folder to enter it, with Back / Up / Terminal folder / Refresh at the top.
+- Name and modification-date column headers toggle ascending/descending sorting; folders stay first. The sort preference persists.
+- Modification dates from Windows and remote POSIX hosts are displayed in the local computer's timezone. Unknown dates sort last.
+- Terminal folder tracking defaults to ON. Entering a folder, going Up or Back turns it OFF and pins both the folder and its machine, even when another terminal is selected. Click Terminal folder OFF to turn tracking ON and jump to the current terminal location. Clicking ON explicitly also allows pinning the current location. Browsing never changes the terminal directory.
 
-- **Download** a file or a whole folder to `~/Downloads`. From a remote space it copies with `scp` through the same ssh address Herdr uses for that machine. Big files are fine: transfers run in the background, with a line at the bottom of the panel while they go and a notification when they're done.
-- **Upload:** copy files or folders in Finder (⌘C), right-click a folder in Files and choose **Paste into this folder** (or right-click empty space to paste into the folder shown). Or click a row and press **⌘V**: it pastes into the selected folder, beside the selected file, or into the shown folder when nothing is selected. Dragging files from Finder onto the panel does the same.
-- **Never overwrites:** if the name is taken, the new copy becomes `name (1).ext`. Unfinished transfers sit in a hidden temporary folder, so a half-copied file never appears under its real name.
-- **New file**, **New folder** and **Rename**, in a small name dialog. Existing names are refused, never replaced.
-- **Move to Trash** on this Mac (Finder's Put Back works). On a remote machine, which has no Trash, **Delete** asks first and deletes permanently.
-- **Previews:** Markdown drawn formatted (with a Source toggle) and images fitted to the panel, HEIC and TIFF included, from remote machines too. Pair it with [Preview Plus](https://github.com/linziyanleo/herdr-mods/tree/main/preview-plus) for PDFs, zoom and Markdown links (see below).
-- **Copy path**, and **Reveal in Finder** for local files.
-- **1184 icons** from [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme), matched the way VS Code does (`package.json`, `app.spec.ts`, `src/`, `.github/`…), with light-theme variants.
-- English or Russian, following the language of macOS.
+- Right-click file/folder → download to the Windows Downloads known folder.
+- Copy files/folders in Explorer, then Ctrl+V or Paste into this folder in Files.
+- Drag files/folders onto a row to upload/copy into that folder.
+- New file, new folder, rename, copy path, Show in Explorer, local Recycle Bin.
+- Background transfers; existing names get `name (1).ext` instead of replacement.
+- Read-only text/Markdown and standard image previews.
+- Local Windows files; remote Linux/macOS and remote Windows paths in machines connected to Herdr.
 
-## Install
+## Install on Windows
 
-Ask the agent running in Herdr:
+Requires the Herdr desktop app, Windows PowerShell 5.1 and Windows OpenSSH `scp.exe`.
+Start Herdr with Pixel HQ selected, open PowerShell in this repository, and run:
 
-```
-Add the Herdr mod from https://github.com/vladimiryakimenko/herdr-files-transfer
-```
-
-Or from a terminal, with Herdr running:
-
-```sh
-git clone https://github.com/vladimiryakimenko/herdr-files-transfer
-sh herdr-files-transfer/install.sh
+```powershell
+.\install-windows.ps1
 ```
 
-`install.sh` copies `mods/files-transfer` into `~/.config/herdr-app/mods/` and points the Files panel of the layout on screen at it. Herdr's own layouts are read-only, so a shipped one (`main`) is cloned first as `main-files-transfer` and the window switches to it. Run it again to update the mod.
+The installer creates `mods/files-transfer-windows` and clones the current layout to
+`pixel-hq-files-transfer-windows`. It connects only the clone's Files block; the Files
+button remains the same. Existing names are refused, not overwritten.
+Return to the old layout in Settings → Look. No EXE build is needed.
 
-By hand: copy `mods/files-transfer` to `~/.config/herdr-app/mods/`, then in your layout's JSON (clone a shipped one first: `herdr-app do layout.clone '{"name":"main","as":"my-main"}'`) change the Files block's `"mod": "files"` to `"mod": "files-transfer"`, keeping its `"id": "files"`. Check it with `herdr-app check ~/.config/herdr-app/mods/files-transfer`.
+## Remote connections
 
-**Uninstall:** switch layouts back (ctrl-shift-l), delete `~/.config/herdr-app/mods/files-transfer` and the cloned layout file.
+Use machines already connected in Herdr through SSH (with herdr-core), and configure
+non-interactive OpenSSH key/agent authentication. Transfers use the machine's SSH alias
+and Windows `scp.exe` with BatchMode=yes. A host that only offers SFTP, without a shell
+or Herdr connection, cannot be added as a standalone SFTP session by this mod.
 
-## With Preview Plus
+Remote POSIX steps use `sh`/`mktemp` and the original placement script. Remote Windows
+filesystem actions use a small PowerShell helper sent in memory; no separate server
+software or permanent helper file is installed. Drive/UNC paths select Windows handling.
+Use a normal `~/.ssh/config` Host alias for custom ports, keys and IPv6 hosts.
 
-[Preview Plus](https://github.com/linziyanleo/herdr-mods/tree/main/preview-plus) by linziyanleo adds PDF pages, image zoom and followable Markdown links. Install its `mods/preview-plus/` too, then make your layout's Files block a stack of the two (keep `"id": "files"`):
+## Implementation and limits
 
-```json
-{ "id": "files", "type": "stack", "active": "files-plus-tree", "children": [
-  { "id": "files-plus-tree", "type": "block", "content": { "mod": "files-transfer", "props": { "previewStack": "files" } } },
-  { "id": "preview-plus", "type": "block", "content": { "mod": "preview-plus", "props": { "previewStack": "files" } } } ] }
+PowerShell helpers use JSON requests (passed through UTF-16LE EncodedCommand), literal
+paths and .NET operations. No shell interpolation of file names, no execution-policy
+change. A new temporary folder holds transfers until publication. File and directory
+moves refuse existing names. Source links/junctions are refused for local recursive copy.
+Failed jobs report errors; multiple selected items are not an all-or-nothing transaction:
+items already published before a later failure remain at the destination.
+
+The footer shows transfer activity, not byte percentage. Cancellation and reconnect/resume
+are not implemented. Active transfers are not restored into the UI after an app restart.
+Remote permanent deletion still requires the original confirmation dialog. Local deletion
+uses the Windows Recycle Bin; cancelling Windows' operation must leave the file in place.
+HEIC/AVIF need a codec and are not promised by this port; common PNG/JPEG/GIF/BMP/SVG and
+Windows-supported TIFF/ICO are the intended preview formats. macOS paths remain in the
+source but are not regression-tested in this adaptation.
+
+## Validation
+
+```powershell
+python -X utf8 tests/windows_smoke.py
+& "$env:LOCALAPPDATA\Programs\herdr-app\herdr-app.exe" check "$PWD\mods\files-transfer-windows"
 ```
 
-Clicking Markdown, PNG, JPEG, WebP, SVG or PDF then opens it in Preview Plus, and its ← comes back to the tree. Remote images and PDFs are copied to this Mac first, since Preview Plus reads only local media. Other files keep the built-in preview.
+The smoke check uses disposable local files to exercise Windows filesystem operations,
+detached transfers, Unicode/quotes/brackets, duplicate names, hidden folder contents and
+Windows destination finalization. It never connects to a user's server unless explicitly invoked with `--remote-machine <alias>`.
+A real Windows-to-Linux SCP roundtrip has also passed on a configured test host, with a
+Unicode/brackets/apostrophe filename and byte-identical content. Remote Windows helpers
+passed an in-memory encoded-command check on local Windows, but a real remote Windows
+connection has not been tested. Real remote
+Linux/Windows transfers require a configured test host; do not infer those from a local pass.
 
-## Requirements
+## Publishing / credits
 
-- The Herdr desktop app, macOS. Paste, Copy path and Reveal in Finder use macOS tools (`osascript`, `pbcopy`, `open`).
-- For remote machines: `scp` here and ssh access with keys or an agent (no password prompts: it runs with `BatchMode=yes`). Machines added to Herdr through ssh already have this.
-
-## What it runs
-
-`trash` (macOS) for Move to Trash; `sips` for image previews; `sh` and `git` in the shown folder to list it and mark changes, like Herdr's own Files panel. For transfers: `scp`, `cp`, `mktemp` and `mv`/`ln` on the target machine, `rm -rf` when you delete. `defaults read -g AppleLanguages` once, for the language. `hc machine ls` to find a machine's ssh address. No network requests of its own; no data leaves your machines.
-
-## Updating the icons
-
-```sh
-node tools/build-icons.mjs            # the pinned version, 5.40.0
-node tools/build-icons.mjs 5.41.0     # another one
-```
-
-## Credits and license
-
-Code: Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Based on [File Icons](https://github.com/amster93/herdr-file-icons) by amster93, which is built from Herdr's shipped `files` mod. Icons: [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme), MIT, see [mods/files-transfer/LICENSE-material-icon-theme.txt](mods/files-transfer/LICENSE-material-icon-theme.txt). Menu glyphs and chevrons: [Lucide](https://lucide.dev), ISC, see [LICENSE-Lucide.txt](LICENSE-Lucide.txt).
-
----
-
-## По-русски
-
-Панель Files для Herdr с передачей файлов. Правый клик по файлу или папке: **скачать** в «Загрузки», **вставить** файлы, скопированные в Finder (загрузка на сервер; или выделите строку и нажмите ⌘V), **новый файл**, **новая папка**, **переименовать**, **в Корзину** (на сервере: удалить с подтверждением), **скопировать путь**, **показать в Finder**. Markdown показывается отформатированным, картинки открываются на просмотр; вместе с Preview Plus ещё PDF и масштаб. Работает и на этом компьютере, и на удалённых машинах по ssh. Файлы можно перетаскивать из Finder в панель. Существующие файлы не перезаписываются: копия получает имя `имя (1).ext`.
-
-Установка, при запущенном Herdr: `sh install.sh` из этой папки. Или попросите агента в Herdr: «Add the Herdr mod from https://github.com/vladimiryakimenko/herdr-files-transfer».
+You may publish a modified version subject to Apache-2.0 and the retained third-party
+licenses: keep LICENSE, NOTICE, source attributions, Material Icon Theme's MIT notice,
+and Lucide's ISC notice. Mark modified files. A new independent GitHub repository is allowed; a GitHub Fork is not required.
+Retain the upstream attribution and all required license notices. Do not include your `.ssh` files, app state, personal logs or machine
+addresses in a public repository. The installer never creates or pushes a GitHub repository.
+See LICENSE, NOTICE, and the LICENSE-* files inside the mod. Original documentation is
+in UPSTREAM_README.md; its macOS installation command is not the Windows installer.

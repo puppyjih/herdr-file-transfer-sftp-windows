@@ -1,3 +1,4 @@
+// Modified for Windows and remote Windows hosts, 2026-11-17. See NOTICE.
 // Files Transfer: Herdr's Files panel with VS Code's Material Icon Theme icons and file transfer.
 // A lazy file browser for the focused pane's folder, with bounded read-only previews, and a
 // right-click menu that downloads, uploads (paste from Finder, or drop), copies paths, creates,
@@ -10,8 +11,12 @@
 // English/Russian text.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, InputState, Input } from "gpui-base";
-import { spaces, panes, focused, run, exec, readTextFile, watchFolder, theme, settings, window, props, openOverlay, closeOverlay, shared, setShared, notify, hc, appHome, home } from "herdr";
+import { spaces, panes, focused, run, exec, readTextFile, watchFolder, theme, settings, window, props, openOverlay, closeOverlay, shared, setShared, notify, hc, appHome, home, checking } from "herdr";
 import ICONS from "./icons.js";
+import {browserPath,parentPath,joinPath,sortedEntries,modifiedLabel} from "./browser.js";
+import {win, winResult, normalize, jobPath, isWindowsPath} from "./windows.js";
+const windowsHost = () => window()?.platform === "windows";
+const windowsTarget = (on, path) => on ? isWindowsPath(path) : windowsHost();
 
 // Right-click menu on a file or folder: download it to ~/Downloads (scp from a remote
 // machine, cp here), paste files copied in Finder into it (upload), copy its path, show it
@@ -19,8 +24,8 @@ import ICONS from "./icons.js";
 // and the confirmation are this mod opened as a popup / dialog (props().menu, .confirm);
 // they hand the choice to the panel that opened them through shared "files.request", since
 // an overlay's tasks end when it closes and a transfer can take long.
-const REQUEST = "files-transfer.request";
-const LANG_KEY = "files-transfer.lang";
+const REQUEST = "files-transfer-windows.request";
+const LANG_KEY = "files-transfer-windows.lang";
 const MENU_ROW = 31;
 // Our temporary folders, never listed in the tree.
 const TEMP = /^\.herdr-(upload|download)\./;
@@ -144,7 +149,10 @@ const STRINGS = {
     remoteDelete: "На этой машине нет Корзины: удаление навсегда.",
   },
 };
-const T = () => STRINGS[shared(LANG_KEY)] ?? STRINGS.en;
+const T = () => {
+ const t=STRINGS[shared(LANG_KEY)] ?? STRINGS.en;
+ return windowsHost()?{...t,reveal:"Show in Explorer",nothingToPasteBody:"Copy files or folders in Explorer (Ctrl+C), then paste here (Ctrl+V).",openInPreview:"Open in default app",badName:"Enter a valid file name without path separators"}:t;
+};
 
 // Previews: Markdown is drawn formatted (with a Source toggle); images are copied into the
 // app folder first, because image() only reads from there, and the formats GPUI can't draw
@@ -152,7 +160,7 @@ const T = () => STRINGS[shared(LANG_KEY)] ?? STRINGS.en;
 const MARKDOWN = /\.(md|markdown|mdx)$/i;
 const IMAGE = /\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|heic|heif|avif)$/i;
 const CONVERT = /\.(ico|tiff?|heic|heif|avif)$/i;
-const PREVIEW_DIR = "data/files-transfer/preview";
+const PREVIEW_DIR = "data/files-transfer-windows/preview";
 const MAX_IMAGE = 50 * 1024 * 1024;
 // Preview Plus (linziyanleo/herdr-mods), when the layout pairs it with this panel in a stack
 // (this block's props.previewStack names the stack, its child "preview-plus" shows the file):
@@ -163,7 +171,7 @@ const PP_MARKDOWN = /\.(md|markdown)$/i;
 const PP_MEDIA = /\.(png|jpe?g|webp|svg|pdf)$/i;
 const bytesText = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 
-const parentOf = path => path.slice(0, path.lastIndexOf("/")) || "/";
+const parentOf = path => {const p=normalize(path),parent=p.slice(0,p.lastIndexOf("/"))||"/";return /^[A-Za-z]:$/.test(parent)?parent+"/":parent;};
 
 // A menu row is [action, label, icon]; null draws a divider.
 const MENU = (target, t = T()) => target.root
@@ -183,7 +191,7 @@ const MENU = (target, t = T()) => target.root
       target.on ? ["delete", t.delete, "trash.svg"] : ["trash", t.moveToTrash, "trash.svg"],
     ];
 // A name typed for a new entry or a rename: one path component.
-const validName = (n) => n !== "" && n !== "." && n !== ".." && !/[\/\u0000-\u001f]/.test(n);
+const validName = (n) => n !== "" && n !== "." && n !== ".." && !/[\/\\\u0000-\u001f]/.test(n);
 // Run on the entry's machine. Each refuses to replace what is there (exit 17).
 const MAKE_FILE = 'set -C; [ -e "$1" ] || [ -L "$1" ] && exit 17; : > "$1"';
 const MAKE_FOLDER = '[ -e "$1" ] || [ -L "$1" ] && exit 17; mkdir -- "$1"';
@@ -194,12 +202,12 @@ function location() {
   const space = spaces().find(s => s.active), f = focused();
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
-  return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
+  return { cwd: normalize(pane?.cwd || f?.cwd || space?.folder), on };
 }
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
-const DIR = "mods/files-transfer";
+const DIR = "mods/files-transfer-windows";
 
 // Material Icon Theme's rules, as VS Code applies them: names match case-insensitively; a
 // path rule (".github/workflows") beats a name, a name beats an extension, and the longest
@@ -222,17 +230,12 @@ function icon(path, dir, open, dark) {
 }
 
 async function directory(path, on) {
-  if (!on && window()?.platform === "windows") {
-    const r = await exec("powershell", ["-NoProfile", "-Command", "& { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)) } }) | ConvertTo-Json -Compress }", path]);
-    if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
-    const result = JSON.parse(r.stdout || "[]");
-    return Array.isArray(result) ? result : [result];
-  }
-  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ] && [ ! -L "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
+  if(windowsTarget(on,path)) return win("list",{path},on);
+  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ] && [ ! -L "$p" ]; then kind=d; else kind=f; fi; stamp=$(stat -c %Y -- "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null); printf "%s\\0%s\\0%s\\0" "$kind" "$stamp" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
   const r = await exec("sh", ["-c", script, "files", path], { on });
   if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
   const fields = r.stdout.split("\0"), out = [];
-  for (let i = 0; i + 1 < fields.length; i += 2) out.push({ name: fields[i + 1], dir: fields[i] === "d" });
+  for (let i = 0; i + 2 < fields.length; i += 3) out.push({ name: fields[i + 2], dir: fields[i] === "d",mtime:fields[i+1]!==""&&Number.isFinite(Number(fields[i+1]))?Number(fields[i+1])*1000:null });
   return out;
 }
 
@@ -243,47 +246,82 @@ export default class Files extends View {
     // Which panel a menu choice is for: the one that opened the menu.
     this.me = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     this.jobs = [];
+    this.originKey=key();this.followTerminalEnabled=true;this.pinnedLocation=null;this.history=[];
+    try {const saved=JSON.parse(localStorage.getItem("browser-sort")||"{}");this.sortBy=saved.by==="mtime"?"mtime":"name";this.sortDirection=saved.direction===-1?-1:1;}catch{this.sortBy="name";this.sortDirection=1;}
+
     // ⌘V pastes into the selected row's folder: the panel takes the keyboard when clicked.
     this.keys = cx.focus_handle();
-    exec("sh", ["-c", 'mkdir -p "$1" && find "$1" -mindepth 1 -mmin +60 -delete', "clean", `${appHome()}/${PREVIEW_DIR}`]).catch(() => {});
+    // Cached previews are cleaned individually, never by an unbounded recursive sweep.
+
     this.selected = null; // { path, dir } inside the shown folder
     cx.spawn(async cx => {
+      if(windowsHost() || checking()) return;
       const r = await exec("defaults", ["read", "-g", "AppleLanguages"]).catch(() => null);
       const lang = /^\W*"?ru/m.test(r?.stdout?.split("\n").find(l => /\w/.test(l) && !/^\s*\(/.test(l)) ?? "") ? "ru" : "en";
       if (shared(LANG_KEY) !== lang) setShared(LANG_KEY, lang);
     });
     cx.timer.every(1000, cx => this.poll(cx));
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
-    this.refresh(cx);
+    if(!checking()) this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
   }
 
-  watch(root, cx) {
-    if (this.on || this.watched === root) return;
-    this.watched = root;
-    cx.spawn(async cx => {
-      try { while (this.watched === root) { await watchFolder(root); if (this.watched === root) this.refresh(cx); } }
-      catch { if (this.watched === root) this.watched = null; }
+  viewLocation() {
+    if(this.followTerminalEnabled===false&&this.pinnedLocation)return this.pinnedLocation;
+    const base=location();
+    return {...base,cwd:browserPath(base.cwd)};
+  }
+  viewKey(){return JSON.stringify({origin:this.followTerminalEnabled===false?null:key(),...this.viewLocation()});}
+  navigate(path,cx,remember=true){
+    const next=browserPath(path),current=this.viewLocation();
+    if(!next)return;
+    if(remember&&this.root&&next!==this.root){this.history.push(this.root);if(this.history.length>100)this.history.shift();}
+    // Pin both machine and folder: switching terminals must not retarget a transfer.
+    this.followTerminalEnabled=false;this.pinnedLocation={cwd:next,on:current.on};
+    this.refresh(cx);cx.notify();
+  }
+  goBack(cx){const path=this.history.pop();if(path)this.navigate(path,cx,false);}
+  followTerminal(cx){
+    this.originKey=key();this.followTerminalEnabled=true;this.pinnedLocation=null;this.history=[];
+    this.show(null);this.selected=null;this.refresh(cx);cx.notify();
+  }
+  toggleTerminalFollow(cx){
+    if(this.followTerminalEnabled!==false){
+      this.pinnedLocation=this.viewLocation();this.followTerminalEnabled=false;this.refresh(cx);cx.notify();
+    }else this.followTerminal(cx);
+  }
+  setSort(field,cx){
+    this.sortDirection=this.sortBy===field?-this.sortDirection:field==="mtime"?-1:1;
+    this.sortBy=field;
+    localStorage.setItem("browser-sort",JSON.stringify({by:field,direction:this.sortDirection}));cx.notify();
+  }
+  watch(root,cx){
+    if(this.on||this.watched===root)return;
+    this.watched=root;const context=this.context;
+    cx.spawn(async cx=>{
+      try {while(this.context===context&&this.watched===root){this.folderWatch=watchFolder(root);await this.folderWatch;if(this.context===context&&this.watched===root)this.refresh(cx);}}
+      catch{if(this.context===context)this.watched=null;}
     });
   }
 
   async loadFolder(path, context) {
     const on = this.on, root = this.root;
     const entries = (await directory(path ? `${root}/${path}` : root, on)).filter(e => !TEMP.test(e.name));
-    if (key() !== context || (path && !this.folders.has(path))) return;
+    if (this.viewKey() !== context || (path && !this.folders.has(path))) return;
     const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
     this.entries.set(path, entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)));
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
   refresh(cx) {
-    if (this.loading) return;
-    const { cwd, on } = location(), context = key();
+    if(this.followTerminalEnabled!==false&&this.originKey!==key()){this.originKey=key();this.history=[];}
+    const {cwd,on}=this.viewLocation(),context=this.viewKey();
     if (context !== this.context) {
+      this.folderWatch?.cancel?.();this.folderWatch=null;this.loading=false;
       this.context = context; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set();
       this.pending = new Set(); this.marks = {}; this.selected = null; this.show(null); this.watched = null; this.error = null; this.limited = false;
     }
-    if (!cwd) return;
+    if (!cwd || this.loading) return;
     this.loading = true;
     this.limited = false;
     cx.spawn(async cx => {
@@ -299,10 +337,10 @@ export default class Files extends View {
             marks[`${top.stdout.trim()}/${entry.slice(3)}`] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
           }
         }
-        if (key() !== context) return;
+        if (this.viewKey() !== context) return;
         this.marks = marks; this.error = null; this.watch(cwd, cx);
-      } catch (e) { if (key() === context) this.error = String(e); }
-      finally { this.loading = false; cx.notify(); }
+      } catch (e) { if (this.viewKey() === context) this.error = String(e); }
+      finally {if(this.context===context)this.loading=false;cx.notify();}
     });
   }
 
@@ -319,7 +357,7 @@ export default class Files extends View {
         this.pending.add(path);
         cx.spawn(async cx => {
           try { await this.loadFolder(path, context); }
-          catch (e) { if (key() === context) this.error = String(e); }
+          catch (e) { if (this.viewKey() === context) this.error = String(e); }
           finally { this.pending.delete(path); cx.notify(); }
         });
       }
@@ -330,14 +368,14 @@ export default class Files extends View {
   show(path, cx) {
     this.code?.release(); this.code = null; this.file = path; this.fileError = null;
     this.md = null; this.source = false;
-    if (this.img) { exec("rm", ["-rf", parentOf(this.img.abs)]).catch(() => {}); this.img = null; }
+    if (this.img) { this.cleanPreview(parentOf(this.img.abs)); this.img = null; }
     if (!path || !cx) return;
     if (IMAGE.test(path)) return this.showImage(path, cx);
     const context = this.context, root = this.root, on = this.on;
     cx.spawn(async cx => {
       try {
         const text = await readTextFile(`${root}/${path}`, { on });
-        if (this.file !== path || key() !== context) return;
+        if (this.file !== path || this.viewKey() !== context) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
         if (MARKDOWN.test(path)) this.md = text.length > 400000 ? text.slice(0, 400000) : text;
@@ -346,13 +384,25 @@ export default class Files extends View {
           value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
           font_family: settings().font_family, font_size: 12,
           syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
-      } catch { if (this.file === path && key() === context) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
+      } catch { if (this.file === path && this.viewKey() === context) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
       finally { cx.notify(); }
     });
   }
 
   // A copy of src (on machine `on`) in this mod's preview folder, here; its absolute path.
+  cleanPreview(path) {
+    if(windowsHost()) win("preview-clean",{path}).catch(()=>{});
+    else exec("rm",["-rf",path]).catch(()=>{});
+  }
   async stage(src, on) {
+    if(windowsHost()) {
+      if(on){
+        const size=windowsTarget(on,src)?await win("size",{path:src},on):Number((await exec("sh",["-c",'wc -c < "$1"',"size",src],{on})).stdout.trim());
+        if(!Number.isFinite(size)||size>MAX_IMAGE)throw Error(T().imageTooBig(bytesText(size)));
+      }
+      const dir=`${normalize(appHome())}/${PREVIEW_DIR}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`;
+      return win("stage",{source:on?`${await sshTarget(on)}:${src}`:src,remote:!!on,destination:dir+"/"+normalize(src).split("/").pop()});
+    }
     const size = await exec("sh", ["-c", 'wc -c < "$1"', "size", src], { on });
     if (size.code !== 0) throw new Error((size.stderr || T().imageFailed).trim());
     const bytes = Number(size.stdout.trim());
@@ -395,6 +445,13 @@ export default class Files extends View {
       let file = null;
       try {
         const staged = await this.stage(src, on), dir = parentOf(staged.file), bytes = staged.bytes;
+        if(windowsHost()) {
+          file=staged.file;
+          const meta=await win("image",{path:file});file=meta.file;
+          if(this.file!==path || this.viewKey()!==context){this.cleanPreview(dir);return;}
+          this.img={rel:file.slice(normalize(appHome()).length+1),abs:file,local:on?null:src,w:meta.w,h:meta.h,bytes};
+          return;
+        }
         file = `${dir}/${id}.${ext}`;
         await exec("mv", [staged.file, file]);
         if (CONVERT.test(path)) {
@@ -410,11 +467,11 @@ export default class Files extends View {
           w = Number(d.stdout.match(/pixelWidth:\s*(\d+)/)?.[1]) || null;
           h = Number(d.stdout.match(/pixelHeight:\s*(\d+)/)?.[1]) || null;
         }
-        if (this.file !== path || key() !== context) { await exec("rm", ["-rf", parentOf(file)]); return; }
+        if (this.file !== path || this.viewKey() !== context) { await exec("rm", ["-rf", parentOf(file)]); return; }
         this.img = { rel: file.slice(appHome().length + 1), abs: file, local: on ? null : src, w, h, bytes };
       } catch (e) {
-        if (file) exec("rm", ["-rf", parentOf(file)]).catch(() => {});
-        if (this.file === path && key() === context) this.fileError = String(e.message ?? e);
+        if(file) this.cleanPreview(parentOf(file));
+        if (this.file === path && this.viewKey() === context) this.fileError = String(e.message ?? e);
       } finally { cx.notify(); }
     });
   }
@@ -423,7 +480,7 @@ export default class Files extends View {
   preview(t) {
     const img = this.img;
     if (img) {
-      const room = { w: (this.size?.width ?? 360) - 32, h: (this.size?.height ?? 480) - 42 - 34 - 32 - (this.jobs.length ? 30 : 0) };
+      const room = { w: Math.max(1,(this.size?.width ?? 360) - 32), h: Math.max(1,(this.size?.height ?? 480) - 42 - 32 - 28 - 34 - 32 - (this.jobs.length ? 30 : 0)) };
       const k = img.w && img.h ? Math.min(1, room.w / img.w, room.h / img.h) : null;
       const info = [img.w && `${img.w}×${img.h}`, bytesText(img.bytes), k !== null && k < 1 && `${Math.round(k * 100)}%`].filter(Boolean).join(" · ");
       return v_flex().flex_1().min_h(0)
@@ -433,7 +490,7 @@ export default class Files extends View {
           .child(div().flex_1().min_w(0).truncate().child(info))
           .child(div().id("files-open-preview").px(8).py(3).rounded(6).cursor_pointer().text_color(t.muted)
             .hover(s => s.bg(t.hover).text_color(t.foreground))
-            .on_click(() => exec("open", ["-a", "Preview", img.local ?? img.abs]).catch(() => {}))
+            .on_click(() => (windowsHost()?win("open",{path:img.local ?? img.abs}):exec("open", ["-a", "Preview", img.local ?? img.abs])).catch(() => {}))
             .child(T().openInPreview)));
     }
     if (this.md !== null && !this.source) {
@@ -449,7 +506,7 @@ export default class Files extends View {
     const target = path
       ? { path: `${this.root}/${path}`, name: path.split("/").pop(), dir, on: this.on ?? null, from: this.me }
       : { path: this.root, name: this.root.split("/").pop(), dir: true, root: true, on: this.on ?? null, from: this.me };
-    openOverlay({ mod: "files-transfer", kind: "popup", width: 250, height: menuHeight(MENU(target)), props: { menu: target } });
+    openOverlay({ mod: "files-transfer-windows", kind: "popup", width: 250, height: menuHeight(MENU(target)), props: { menu: target } });
   }
 
   // A choice made in the menu or the confirmation, for this panel.
@@ -460,37 +517,38 @@ export default class Files extends View {
     setShared(REQUEST, null);
     const { action, path, name, dir, on } = req;
     if (action === "delete") {
-      openOverlay({ mod: "files-transfer", kind: "dialog", width: 420, height: 176, props: { confirm: { path, name, dir, on, from: this.me } } });
+      openOverlay({ mod: "files-transfer-windows", kind: "dialog", width: 420, height: 176, props: { confirm: { path, name, dir, on, from: this.me } } });
       return;
     }
     if (action === "new-file" || action === "new-folder" || action === "rename") {
       // New entries go into the folder clicked, or beside the file clicked.
       const folder = action === "rename" ? parentOf(path) : dir ? path : parentOf(path);
-      openOverlay({ mod: "files-transfer", kind: "dialog", width: 440, height: 214,
+      openOverlay({ mod: "files-transfer-windows", kind: "dialog", width: 440, height: 214,
         props: { ask: { kind: action, folder, path, name, dir, on, from: this.me } } });
       return;
     }
     cx.spawn(async cx => {
       try {
         if (action === "copy") {
-          await exec("sh", ["-c", 'printf %s "$1" | pbcopy', "copy", path]);
+          if(windowsHost()) await win("copy-path",{path});
+          else await exec("sh", ["-c", 'printf %s "$1" | pbcopy', "copy", path]);
           notify({ title: T().pathCopied, body: path, level: "info", timeout: 2500 });
         } else if (action === "reveal") {
-          await exec("open", ["-R", path]);
+          if(windowsHost()) await win("reveal",{path});else await exec("open", ["-R", path]);
         } else if (action === "download") {
           await this.download(path, name, dir, on);
         } else if (action === "paste") {
           await this.paste(dir ? path : parentOf(path), on);
         } else if (action === "trash") {
           if (on || path === this.root || path.split("/").filter(Boolean).length < 2) throw new Error(T().tooDangerous(path));
-          const r = await exec("trash", [path]);
+          const r = windowsHost()?await winResult("trash",{path,root:this.root}):await exec("trash", [path]);
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().trashed(name), body: path.replace(home(), "~"), level: "success", timeout: 4000 });
           if (this.file && `${this.root}/${this.file}`.startsWith(path)) this.show(null);
           this.refresh(cx);
         } else if (action === "create-file" || action === "create-folder") {
           const target = `${req.folder}/${req.value}`;
-          const r = await exec("sh", ["-c", action === "create-file" ? MAKE_FILE : MAKE_FOLDER, "make", target], { on });
+          const r = windowsTarget(on,target)?await winResult(action==="create-file"?"new-file":"new-folder",{path:target},on):await exec("sh", ["-c", action === "create-file" ? MAKE_FILE : MAKE_FOLDER, "make", target], { on });
           if (r.code === 17) throw new Error(T().exists(req.value));
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().created(req.value), body: on ? `${on}:${target}` : target.replace(home(), "~"), level: "success", timeout: 3000 });
@@ -499,7 +557,7 @@ export default class Files extends View {
         } else if (action === "rename-yes") {
           const target = `${parentOf(path)}/${req.value}`;
           if (target === path) return;
-          const r = await exec("sh", ["-c", MOVE, "move", path, target], { on });
+          const r = windowsTarget(on,path)?await winResult("rename",{path,to:target},on):await exec("sh", ["-c", MOVE, "move", path, target], { on });
           if (r.code === 17) throw new Error(T().exists(req.value));
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().renamed(name, req.value), body: on ? `${on}:${target}` : target.replace(home(), "~"), level: "success", timeout: 3000 });
@@ -509,7 +567,7 @@ export default class Files extends View {
         } else if (action === "delete-yes") {
           // Never the shown folder itself, the home folder or a root-level path.
           if (path === this.root || path.split("/").filter(Boolean).length < 2) throw new Error(T().tooDangerous(path));
-          const r = await exec("rm", ["-rf", "--", path], { on });
+          const r = windowsTarget(on,path)?await winResult("remove",{path,root:this.root},on):await exec("rm", ["-rf", "--", path], { on });
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().deleted(name), body: on ? `${on}:${path}` : path, level: "success", timeout: 4000 });
           if (this.file && `${this.root}/${this.file}`.startsWith(path)) this.show(null);
@@ -527,8 +585,9 @@ export default class Files extends View {
 
   // Files copied in Finder, uploaded into folder (absolute, on the machine `on`).
   async paste(folder, on) {
-    const r = await exec("osascript", ["-l", "JavaScript", "-e", CLIPBOARD]);
-    const files = r.code === 0 ? JSON.parse(r.stdout.trim() || "[]") : [];
+    let files;
+    if(windowsHost()) files=await win("clipboard-files");
+    else {const r=await exec("osascript",["-l","JavaScript","-e",CLIPBOARD]);files=r.code===0?JSON.parse(r.stdout.trim()||"[]"):[];}
     if (!files.length) return notify({ title: T().nothingToPaste, body: T().nothingToPasteBody, level: "warning", timeout: 5000 });
     await this.upload(files, folder, on);
   }
@@ -555,8 +614,13 @@ export default class Files extends View {
   }
 
   async download(path, name, dir, on) {
+    if(windowsHost()) {
+      const status=jobPath();
+      await win("start",{status,kind:"download",source:on?`${await sshTarget(on)}:${path}`:path,remote:!!on,name,destination:await win("downloads")});
+      this.jobs.push({kind:"download",status,name,windows:true});return;
+    }
     const src = on ? `${await sshTarget(on)}:${path}` : path;
-    const status = `${appHome()}/data/files-transfer/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const status = `${appHome()}/data/files-transfer-windows/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const r = await exec("sh", ["-c", FETCH, "fetch", src, `${home()}/Downloads`, name, status, on ? "scp" : "cp", dir ? "1" : "0"]);
     if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
     this.jobs.push({ kind: "download", status, name });
@@ -565,11 +629,25 @@ export default class Files extends View {
   // Local files into dir on the shown folder's machine: into a temporary folder there
   // first, then into place under free names (PLACE), so nothing is overwritten.
   async upload(files, dir, on) {
+    if(windowsHost()) {
+      files=files.map(normalize);
+      const names=files.map(p=>p.replace(/\/$/,"").split("/").pop().toLowerCase());
+      if(on&&new Set(names).size!==names.length)throw Error("Upload same-named items separately.");
+      const status=jobPath(),name=files.length===1?names[0]:T().items(files.length);
+      if(!on){await win("start",{status,kind:"upload-local",sources:files,destination:dir});this.jobs.push({kind:"upload",status,name,dir,on,windows:true});return;}
+      const remoteWin=windowsTarget(on,dir);
+      const mk=remoteWin?null:await exec("mktemp",["-d",`${dir}/.herdr-upload.XXXXXX`],{on});
+      if(mk&&mk.code!==0)throw Error(mk.stderr||"Cannot create remote staging folder");
+      const tmp=remoteWin?await win("stage-create",{path:dir},on):mk.stdout.trim();
+      try {await win("start",{status,kind:"upload-remote",sources:files,destination:`${await sshTarget(on)}:${tmp}/`});}
+      catch(e){await this.cleanRemoteStage(tmp,dir,on,remoteWin);throw e;}
+      this.jobs.push({kind:"upload",status,name,tmp,dir,on,remoteWin,windows:true});return;
+    }
     const mk = await exec("mktemp", ["-d", `${dir}/.herdr-upload.XXXXXX`], { on });
     if (mk.code !== 0) throw new Error((mk.stderr || `exit ${mk.code}`).trim());
     const tmp = mk.stdout.trim();
     const dest = on ? `${await sshTarget(on)}:${tmp}/` : `${tmp}/`;
-    const status = `${appHome()}/data/files-transfer/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const status = `${appHome()}/data/files-transfer-windows/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const r = await exec("sh", ["-c", SEND, "send", status, on ? "scp" : "cp", dest, ...files]);
     if (r.code !== 0) {
       await exec("rm", ["-rf", "--", tmp], { on }).catch(() => {});
@@ -580,11 +658,32 @@ export default class Files extends View {
   }
 
   // Finished transfers write their exit code to the status file.
+  async cleanRemoteStage(path,dir,on,remoteWin) {
+    if(remoteWin) await win("stage-remove",{path,destination:dir},on).catch(()=>{});
+    else if(path&&path.startsWith(dir.replace(/\/$/,"")+"/.herdr-upload."))await exec("rm",["-rf","--",path],{on}).catch(()=>{});
+  }
   poll(cx) {
-    if (!this.jobs?.length) return;
+    if (!this.jobs?.length || this.polling) return;
+    this.polling=true;
     cx.spawn(async cx => {
       let changed = false;
-      for (const job of [...this.jobs]) {
+      try { for (const job of [...this.jobs]) {
+        if(job.windows){
+          let result;
+          try {result=await win("status",{status:job.status});}catch {continue;}
+          if(result.code==null)continue;
+          this.jobs=this.jobs.filter(j=>j!==job);changed=true;
+          try {
+            if(result.code!=="0")throw Error(result.log||"Transfer failed");
+            if(job.kind==="upload"&&job.on){
+              if(job.remoteWin)await win("stage-place",{path:job.tmp,destination:job.dir},job.on);
+              else {const r=await exec("sh",["-c",PLACE,"place",job.tmp,job.dir],{on:job.on});if(r.code!==0)throw Error(r.stderr||"Cannot finish upload");}
+            }
+            notify({title:job.kind==="download"?T().downloaded(job.name):T().uploaded(job.name),body:job.on?`${job.on}:${job.dir}`:normalize(result.dest?.[0]||job.dir||""),level:"success",timeout:6000});
+          }catch(e){notify({title:job.kind==="download"?T().downloadFailed(job.name):T().uploadFailed(job.name),body:String(e.message??e),level:"error"});}
+          finally {if(job.tmp)await this.cleanRemoteStage(job.tmp,job.dir,job.on,job.remoteWin);await win("status-clean",{status:job.status}).catch(()=>{});}
+          this.refresh(cx);continue;
+        }
         const code = await readTextFile(job.status).catch(() => null);
         if (code === null) continue;
         this.jobs = this.jobs.filter(j => j !== job);
@@ -612,6 +711,7 @@ export default class Files extends View {
         }
         await exec("rm", ["-f", job.status, `${job.status}.log`, `${job.status}.dest`]).catch(() => {});
       }
+      } finally {this.polling=false;}
       if (changed) cx.notify();
     });
   }
@@ -727,21 +827,29 @@ export default class Files extends View {
 
   rows(prefix, depth, out, t, dark) {
     if (out.length >= TOTAL || depth > 40) return out;
-    for (const entry of this.entries.get(prefix) ?? []) {
+    for (const entry of sortedEntries(this.entries.get(prefix)??[],this.sortBy,this.sortDirection)) {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
         .when(this.selected?.path === path, el => el.bg(t.selected)).hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => { this.select(path, entry.dir); entry.dir ? this.toggle(path, cx) : this.handoff(path, cx) || this.show(path, cx); })
+        .on_click((_e, cx) => { this.select(path, entry.dir); entry.dir ? this.navigate(joinPath(this.root,path),cx) : this.handoff(path, cx) || this.show(path, cx); })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.select(path, entry.dir); cx.notify(); this.openMenu(path, entry.dir); })
         .on_drop((e, cx) => { cx.stop_propagation(); this.drop(e.paths, entry.dir ? path : prefix, cx); })
         .child(entry.dir ? svg(`${DIR}/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(image(icon(path, entry.dir, open, dark)).size(16).flex_none())
-        .child(div().flex_1().min_w(0).truncate().child(entry.name))
+        .child(div().flex_1().min_w(0).truncate().tooltip(entry.name).child(entry.name))
+        .child(div().w(110).flex_none().text_size(10.5).text_color(t.dim).tooltip(Number.isFinite(entry.mtime)?new Date(entry.mtime).toLocaleString():"수정 날짜 없음").child(modifiedLabel(entry.mtime)))
         .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
-      if (entry.dir && open) this.rows(path, depth + 1, out, t, dark);
+
     }
     return out;
+  }
+
+  navButton(id,label,tip,enabled,action,t,active=false){
+    return div().id(id).h(25).px(7).flex_none().flex().items_center().rounded(5).text_size(11).text_color(enabled?t.foreground:t.dim)
+      .when(active,el=>el.bg(t.selected).border_1().border_color(t.accent))
+      .when(enabled,el=>el.cursor_pointer().hover(s=>s.bg(t.hover))).tooltip(tip)
+      .on_click((event,cx)=>{if(enabled)action(event,cx);}).child(label);
   }
 
   render(cx) {
@@ -749,11 +857,11 @@ export default class Files extends View {
     if (props()?.confirm) return this.confirm(theme());
     if (props()?.ask) return this.ask(theme());
     this.take(cx);
-    if (key() !== this.context) this.refresh(cx);
+    if (!checking() && this.viewKey() !== this.context) this.refresh(cx);
     const t = theme(), dark = Boolean(settings().dark);
     return v_flex().id("files").track_focus(this.keys).size_full().min_h(0)
       .on_key_down((e, cx) => {
-        if (e.keystroke === "cmd-v") { cx.stop_propagation(); this.pasteKey(cx); }
+        if (e.keystroke === "cmd-v" || (windowsHost() && e.keystroke === "ctrl-v")) { cx.stop_propagation(); this.pasteKey(cx); }
         else if (e.keystroke === "escape" && this.selected) { cx.stop_propagation(); this.selected = null; cx.notify(); }
       })
       // Sizes arrive in window points; element sizes are given at zoom 1.
@@ -772,12 +880,23 @@ export default class Files extends View {
             .cursor_pointer().text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
             .on_click((_e, cx) => { this.source = !this.source; cx.notify(); })
             .child(this.source ? T().preview : T().source)))))
+      .child(h_flex().h(32).flex_none().px(8).gap(4).items_center().border_b(1).border_color(t.border)
+        .child(this.navButton("files-nav-back","←", "뒤로",this.history.length>0,(_e,cx)=>this.goBack(cx),t))
+        .child(this.navButton("files-nav-up","↑ 상위","상위 폴더",!!this.root&&parentPath(this.root)!==this.root,(_e,cx)=>this.navigate(parentPath(this.root),cx),t))
+        .child(this.navButton("files-nav-terminal","터미널 위치",this.followTerminalEnabled!==false?"ON: 터미널 위치를 따라갑니다. 클릭하면 현재 폴더에 고정합니다.":"OFF: 현재 폴더에 고정되어 있습니다. 클릭하면 터미널 위치로 이동해 다시 따라갑니다.",true,(_e,cx)=>this.toggleTerminalFollow(cx),t,this.followTerminalEnabled!==false))
+        .child(div().flex_1())
+        .child(this.navButton("files-nav-refresh","↻","새로고침",!this.loading,(_e,cx)=>{this.refresh(cx);cx.notify();},t)))
+      .child(div().h(28).flex_none().px(12).flex().items_center().text_size(11).text_color(t.muted).truncate()
+        .tooltip(this.on?`${this.on}:${this.root}`:this.root||"").child(this.on?`${this.on}:${this.root||""}`:this.root||"폴더 없음"))
+      .when(!this.file,el=>el.child(h_flex().h(28).flex_none().px(12).gap(7).items_center().bg(t.surface).text_size(11).text_color(t.muted)
+        .child(div().id("files-sort-name").flex_1().min_w(0).cursor_pointer().on_click((_e,cx)=>this.setSort("name",cx)).child(`이름 ${this.sortBy==="name"?(this.sortDirection===1?"↑":"↓"):""}`))
+        .child(div().id("files-sort-date").w(110).flex_none().cursor_pointer().on_click((_e,cx)=>this.setSort("mtime",cx)).child(`수정 날짜 ${this.sortBy==="mtime"?(this.sortDirection===1?"↑":"↓"):""}`))))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6)
         .on_mouse_down("left", (_e, cx) => { this.selected = null; this.keys.focus(); cx.notify(); })
         .on_mouse_down("right", () => this.root && this.openMenu("", true))
         .on_drop((e, cx) => this.drop(e.paths, "", cx)).children(this.rows("", 0, [], t, dark))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
-        .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
+        .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("현재 폴더는 최대 500개까지 표시합니다")))))
       .when(Boolean(this.file), el => el.child(this.preview(t)))
       .when(this.jobs.length > 0, el => el.child(h_flex().h(30).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border).text_size(12).text_color(t.muted)
         .child(svg(`${DIR}/spinner.svg`).size(12).flex_none().text_color(t.working).spin(900))
