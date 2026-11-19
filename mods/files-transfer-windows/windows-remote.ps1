@@ -32,10 +32,17 @@ function Publish([string]$src,[string]$dir,[string]$n){
 try{
   switch($q.action){
     'list'{
-      Json @(Get-ChildItem -LiteralPath (Full $q.path) -Force | Where-Object {$_.Name -ne '.git' -and $_.Name -notmatch '^\.herdr-(upload|download)\.'} | Select-Object -First 501 | ForEach-Object {@{name=$_.Name;dir=$_.PSIsContainer;mtime=([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeMilliseconds()}})
+      Json @(Get-ChildItem -LiteralPath (Full $q.path) -Force | Where-Object {$_.Name -ne '.git' -and $_.Name -notmatch '^\.herdr-(upload|download)\.'} | Select-Object -First 501 | ForEach-Object {@{name=$_.Name;dir=$_.PSIsContainer;mtime=([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeMilliseconds();size=$_.Length}})
       break
     }
     'size'{Json (Get-Item -LiteralPath (Full $q.path)).Length;break}
+    'tree-bytes'{
+      $path=Full $q.path
+      if(!(Test-Path -LiteralPath $path)){Json 0;break}
+      $sizes=@(Get-ChildItem -LiteralPath $path -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 5001 -ExpandProperty Length)
+      if($sizes.Count -gt 5000){Json $null}else{Json ([long]($sizes | Measure-Object -Sum).Sum)}
+      break
+    }
     'new-file'{$p=Full $q.path;Name ([IO.Path]::GetFileName($p));[IO.File]::Open($p,[IO.FileMode]::CreateNew).Dispose();Json $true;break}
     'new-folder'{$p=Full $q.path;Name ([IO.Path]::GetFileName($p));if(Test-Path -LiteralPath $p){throw 'Name already exists'};New-Item -ItemType Directory -Path $p | Out-Null;Json $true;break}
     'rename'{$p=Full $q.path;$to=Full $q.to;Name ([IO.Path]::GetFileName($to));if([IO.Directory]::Exists($p)){[IO.Directory]::Move($p,$to)}else{[IO.File]::Move($p,$to)};Json $true;break}
@@ -48,7 +55,7 @@ try{
     }
     {$_ -in 'stage-place','stage-remove'}{
       $dir=(Full $q.destination).TrimEnd('\');$stage=Full $q.path
-      if(!$stage.StartsWith($dir+'\',[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($stage) -notmatch '^\.herdr-upload\.[a-f0-9]{32}$'){throw 'Invalid staging path'}
+      if([IO.Path]::GetDirectoryName($stage).TrimEnd('\') -ne $dir -or [IO.Path]::GetFileName($stage) -notmatch '^\.herdr-upload\.[a-f0-9]{32}$'){throw 'Invalid staging path'}
       NoLink $stage
       $names=@()
       if($q.action -eq 'stage-place'){

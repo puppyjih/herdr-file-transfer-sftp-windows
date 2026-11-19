@@ -1,4 +1,4 @@
-# Windows port additions, 2026-11-17. Apache-2.0; see LICENSE and NOTICE.
+# Windows port and transfer queue additions. Apache-2.0; see LICENSE and NOTICE.
 param([Parameter(Mandatory=$true)][string]$RequestJson)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -21,12 +21,54 @@ function Within([string]$p,[string]$root) {
 function NoLink([string]$p) {
   if((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Copying links/junctions is not supported'}
 }
-function Clone([string]$src,[string]$dst) {
+function CheckCancel([string]$status) {
+  if([IO.File]::Exists($status+'.cancel')){throw [OperationCanceledException]::new('Transfer cancelled')}
+}
+function Clone([string]$src,[string]$dst,[string]$status) {
+  CheckCancel $status
   NoLink $src
   if([IO.Directory]::Exists($src)) {
     [IO.Directory]::CreateDirectory($dst) | Out-Null
-    foreach($child in Get-ChildItem -LiteralPath $src -Force){ Clone $child.FullName (Join-Path $dst $child.Name) }
-  } else { [IO.File]::Copy($src,$dst,$false) }
+    foreach($child in Get-ChildItem -LiteralPath $src -Force){ Clone $child.FullName (Join-Path $dst $child.Name) $status }
+    return
+  }
+  $inputStream=[IO.File]::OpenRead($src)
+  try {
+    $outputStream=[IO.File]::Open($dst,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+    try {
+      $buffer=New-Object byte[] 1048576
+      while(($count=$inputStream.Read($buffer,0,$buffer.Length)) -gt 0){
+        CheckCancel $status
+        $outputStream.Write($buffer,0,$count)
+      }
+    } finally {$outputStream.Dispose()}
+  } finally {$inputStream.Dispose()}
+  [IO.File]::SetLastWriteTimeUtc($dst,[IO.File]::GetLastWriteTimeUtc($src))
+}
+function TreeBytes([string]$path,[string]$status) {
+  if(!(Test-Path -LiteralPath $path)){return [long]0}
+  $sum=[long]0
+  $visited=0
+  $pending=[Collections.Generic.Stack[IO.FileSystemInfo]]::new()
+  $pending.Push((Get-Item -LiteralPath $path -Force))
+  while($pending.Count -gt 0){
+    if($status){CheckCancel $status}
+    if(++$visited -gt 5000){return $null}
+    $item=$pending.Pop()
+    if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){return $null}
+    if($item -is [IO.DirectoryInfo]){
+      foreach($child in $item.EnumerateFileSystemInfos()){
+        if(($pending.Count+$visited) -ge 5000){return $null}
+        $pending.Push($child)
+      }
+    }else{$sum+=$item.Length}
+  }
+  $sum
+}
+function RejectNestedCopy([string]$src,[string]$dir){
+  if([IO.Directory]::Exists($src) -and ((Full $dir).TrimEnd('\')+'\').StartsWith((Full $src).TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){
+    throw 'Choose a destination outside the source folder'
+  }
 }
 function Publish([string]$src,[string]$dir,[string]$n) {
   $n=Name $n; $isDir=[IO.Directory]::Exists($src)
@@ -49,11 +91,39 @@ function JobPath([string]$p) {
 }
 function RemoveStage([string]$p,[string]$dir) {
   $p=Within $p $dir
-  if([IO.Path]::GetFileName($p) -notmatch '^\.herdr-(upload|download)\.[a-f0-9]{32}$'){throw 'Invalid staging path'}
-  if(Test-Path -LiteralPath $p){Remove-Item -LiteralPath $p -Recurse -Force}
+  if([IO.Path]::GetDirectoryName($p).TrimEnd('\') -ne (Full $dir).TrimEnd('\') -or
+     [IO.Path]::GetFileName($p) -notmatch '^\.herdr-(upload|download)\.[a-f0-9]{32}$'){throw 'Invalid staging path'}
+  if(Test-Path -LiteralPath $p){NoLink $p;Remove-Item -LiteralPath $p -Recurse -Force}
 }
-function Scp([string[]]$items) {
+function QuoteArgument([string]$arg) {
+  # Windows native argv quoting. Double backslashes before a quote and before the closing quote.
+  '"'+(($arg -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1')+'"'
+}
+function Scp([string[]]$items,[string]$status) {
   $exe=(Get-Command scp.exe -ErrorAction Stop).Source
+  if($status){
+    CheckCancel $status
+    $psi=[Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName=$exe
+    $psi.Arguments=($items | ForEach-Object {QuoteArgument $_}) -join ' '
+    $psi.UseShellExecute=$false
+    $psi.CreateNoWindow=$true
+    $psi.RedirectStandardError=$true
+    $process=[Diagnostics.Process]::Start($psi)
+    try{
+      $errors=$process.StandardError.ReadToEndAsync()
+      while(!$process.WaitForExit(150)){
+        if([IO.File]::Exists($status+'.cancel')){
+          try{$process.Kill()}catch [InvalidOperationException]{if(!$process.HasExited){throw}}
+          $process.WaitForExit()
+          CheckCancel $status
+        }
+      }
+      CheckCancel $status
+      if($process.ExitCode -ne 0){throw "SCP exit $($process.ExitCode): $($errors.GetAwaiter().GetResult())"}
+    }finally{$process.Dispose()}
+    return
+  }
   # Native stderr is diagnostic output, not a PowerShell terminating error.
   $old=$ErrorActionPreference; $ErrorActionPreference='Continue'
   try { $result=& $exe @items 2>&1; $code=$LASTEXITCODE }
@@ -63,35 +133,62 @@ function Scp([string[]]$items) {
 function Worker {
   $status=JobPath $q.status; $stage=$null; $dir=$null; $dest=@()
   try {
+    CheckCancel $status
     if($q.kind -eq 'download') {
       $dir=Full $q.destination; [IO.Directory]::CreateDirectory($dir) | Out-Null
+      if(!$q.remote){RejectNestedCopy (Full $q.source) $dir}
       $stage=Join-Path $dir ('.herdr-download.'+[Guid]::NewGuid().ToString('N'))
       [IO.Directory]::CreateDirectory($stage) | Out-Null
       $n=Name $q.name; $staged=Join-Path $stage $n
-      if($q.remote){Scp @('-r','-p','-B','-o','BatchMode=yes','-o','ConnectTimeout=15','--',[string]$q.source,($staged -replace '\\','/'))}
-      else {Clone (Full $q.source) $staged}
+      $total=if($q.remote){$q.total}else{TreeBytes (Full $q.source) $status}
+      [IO.File]::WriteAllText($status+'.progress',(Json @{path=$staged;total=$total}),$utf8)
+      if($q.remote){Scp @('-r','-p','-B','-o','BatchMode=yes','-o','ConnectTimeout=15','--',[string]$q.source,($staged -replace '\\','/')) $status}
+      else {Clone (Full $q.source) $staged $status}
+      CheckCancel $status
       $dest=@(Publish $staged $dir $n)
     } elseif($q.kind -eq 'upload-local') {
       $dir=Full $q.destination
       if(![IO.Directory]::Exists($dir)){throw 'Destination folder does not exist'}
+      foreach($source in $q.sources){RejectNestedCopy (Full $source) $dir}
       $stage=Join-Path $dir ('.herdr-upload.'+[Guid]::NewGuid().ToString('N'))
       [IO.Directory]::CreateDirectory($stage) | Out-Null
+      $total=[long]0
+      foreach($source in $q.sources){
+        $size=TreeBytes (Full $source) $status
+        if($null -eq $size){$total=$null;break}
+        $total+=$size
+      }
+      [IO.File]::WriteAllText($status+'.progress',(Json @{path=$stage;total=$total}),$utf8)
+      $stagedItems=@()
       foreach($source in $q.sources) {
         $src=Full $source; $n=Name ([IO.Path]::GetFileName($src.TrimEnd('\')))
         $unit=Join-Path $stage ([Guid]::NewGuid().ToString('N'))
         [IO.Directory]::CreateDirectory($unit) | Out-Null
         $item=Join-Path $unit $n
-        Clone $src $item
-        $dest+=Publish $item $dir $n
+        Clone $src $item $status
+        $stagedItems+=@{path=$item;name=$n}
       }
+      CheckCancel $status
+      foreach($item in $stagedItems){$dest+=Publish $item.path $dir $item.name}
     } elseif($q.kind -eq 'upload-remote') {
       $scpArgs=@('-r','-p','-B','-o','BatchMode=yes','-o','ConnectTimeout=15','--')
-      foreach($source in $q.sources){$src=Full $source;NoLink $src;$scpArgs+=($src -replace '\\','/')}
+      $total=[long]0
+      foreach($source in $q.sources){
+        $src=Full $source;NoLink $src
+        if($null -ne $total){
+          $size=TreeBytes $src $status
+          if($null -eq $size){$total=$null}else{$total+=$size}
+        }
+        $scpArgs+=($src -replace '\\','/')
+      }
+      [IO.File]::WriteAllText($status+'.progress',(Json @{total=$total}),$utf8)
       $scpArgs+=[string]$q.destination
-      Scp $scpArgs
+      Scp $scpArgs $status
     } else {throw 'Unknown transfer kind'}
     [IO.File]::WriteAllText($status+'.dest',(Json @($dest)),$utf8)
     [IO.File]::WriteAllText($status+'.tmp','0',$utf8)
+  } catch [OperationCanceledException] {
+    [IO.File]::WriteAllText($status+'.tmp','2',$utf8)
   } catch {
     [IO.File]::WriteAllText($status+'.log',($_.Exception.Message),$utf8)
     [IO.File]::WriteAllText($status+'.tmp','1',$utf8)
@@ -102,7 +199,7 @@ function Worker {
 }
 try {
   switch($q.action) {
-    'worker-file' { $q=Get-Content -LiteralPath $q.requestFile -Raw -Encoding UTF8 | ConvertFrom-Json; Worker; break }
+    'worker-file' { $q=Get-Content -LiteralPath $q.requestFile -Raw -Encoding UTF8 | ConvertFrom-Json; Worker; Json $true; break }
     'start' {
       $status=JobPath $q.status
       [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($status)) | Out-Null
@@ -112,24 +209,47 @@ try {
       $script=Full $q.script
       $command="& ([scriptblock]::Create([IO.File]::ReadAllText('"+$script.Replace("'","''")+"'))) '"+$body.Replace("'","''")+"'"
       $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-      Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-STA','-EncodedCommand',$encoded) -WindowStyle Hidden | Out-Null
+      try {
+        $worker=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-STA','-EncodedCommand',$encoded) -WindowStyle Hidden -PassThru
+      } catch {
+        Remove-Item -LiteralPath ($status+'.request.json') -ErrorAction SilentlyContinue
+        throw
+      }
+      [IO.File]::WriteAllText($status+'.worker',[string]$worker.Id,$utf8)
       Json @{started=$true}; break
     }
     'status' {
       $status=JobPath $q.status
-      if(!(Test-Path -LiteralPath $status)){Json @{code=$null};break}
+      if(!(Test-Path -LiteralPath $status)){
+        if([IO.File]::Exists($status+'.worker')){
+          $workerId=[int][IO.File]::ReadAllText($status+'.worker')
+          if(!(Get-Process -Id $workerId -ErrorAction SilentlyContinue) -and ![IO.File]::Exists($status)){
+            Json @{code='1';log='Transfer process exited without a result'};break
+          }
+        }
+        $info=$null;$bytes=$null
+        if([IO.File]::Exists($status+'.progress')){
+          try{$info=[IO.File]::ReadAllText($status+'.progress') | ConvertFrom-Json;if($info.path){$bytes=TreeBytes $info.path}}catch{}
+        }
+        Json @{code=$null;bytes=$bytes;total=$info.total};break
+      }
       $code=[IO.File]::ReadAllText($status).Trim()
       $log=if(Test-Path -LiteralPath ($status+'.log')){[IO.File]::ReadAllText($status+'.log')}else{''}
       $dest=if(Test-Path -LiteralPath ($status+'.dest')){[IO.File]::ReadAllText($status+'.dest') | ConvertFrom-Json}else{@()}
       Json @{code=$code;log=$log;dest=@($dest)};break
     }
+    'cancel' {
+      $status=JobPath $q.status
+      if([IO.File]::Exists($status+'.request.json') -and ![IO.File]::Exists($status)){[IO.File]::WriteAllText($status+'.cancel','',$utf8)}
+      Json $true;break
+    }
     'status-clean' {
       $status=JobPath $q.status
-      foreach($suffix in @('','.log','.dest','.request.json')){if(Test-Path -LiteralPath ($status+$suffix)){Remove-Item -LiteralPath ($status+$suffix) -Force}}
+      foreach($suffix in @('','.log','.dest','.request.json','.progress','.cancel','.worker','.tmp')){if(Test-Path -LiteralPath ($status+$suffix)){Remove-Item -LiteralPath ($status+$suffix) -Force}}
       Json $true;break
     }
     'list' {
-      $items=@(Get-ChildItem -LiteralPath (Full $q.path) -Force | Where-Object {$_.Name -ne '.git' -and $_.Name -notmatch '^\.herdr-(upload|download)\.'} | Select-Object -First 501 | ForEach-Object {@{name=$_.Name;dir=$_.PSIsContainer;mtime=([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeMilliseconds()}})
+      $items=@(Get-ChildItem -LiteralPath (Full $q.path) -Force | Where-Object {$_.Name -ne '.git' -and $_.Name -notmatch '^\.herdr-(upload|download)\.'} | Select-Object -First 501 | ForEach-Object {@{name=$_.Name;dir=$_.PSIsContainer;mtime=([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeMilliseconds();size=$_.Length}})
       Json @($items);break
     }
     'size' { Json (Get-Item -LiteralPath (Full $q.path)).Length;break }

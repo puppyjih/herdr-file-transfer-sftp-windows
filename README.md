@@ -7,7 +7,12 @@ Windows adaptation of [Files Transfer by vladimiryakimenko](https://github.com/v
 ## What it adds
 
 - Explorer-style folder navigation: click a folder to enter it, with Back / Up / Terminal folder / Refresh at the top.
-- Name and modification-date column headers toggle ascending/descending sorting; folders stay first. The sort preference persists.
+- Paste an absolute path into the address bar and press Enter. Use the filter below it for partial names or patterns like **\*.png**.
+- Name, size, and modification-date headers toggle ascending/descending sorting; folders stay first. The sort preference persists.
+- Ctrl-click to pick items or Shift-click to select a range. Use the download button or right-click the selection.
+- The **`>_` icon** next to download Settings opens a new terminal in the browsed folder on the same machine.
+- On Windows, **Split** shows a local folder on the left and the Files folder on the right. Select items and use **Upload →** or **← Download**.
+- **↓ Settings** remembers a local download folder per machine or Git project. The selected left folder takes priority in Split view.
 - Modification dates from Windows and remote POSIX hosts are displayed in the local computer's timezone. Unknown dates sort last.
 - Terminal folder tracking defaults to ON. Entering a folder, going Up or Back turns it OFF and pins both the folder and its machine, even when another terminal is selected. Click Terminal folder OFF to turn tracking ON and jump to the current terminal location. Clicking ON explicitly also allows pinning the current location. Browsing never changes the terminal directory.
 
@@ -54,8 +59,10 @@ moves refuse existing names. Source links/junctions are refused for local recurs
 Failed jobs report errors; multiple selected items are not an all-or-nothing transaction:
 items already published before a later failure remain at the destination.
 
-The footer shows transfer activity, not byte percentage. Cancellation and reconnect/resume
-are not implemented. Active transfers are not restored into the UI after an app restart.
+On Windows, **Queue** runs one item at a time. It shows measured bytes, a percentage and an
+estimated time when the total is known. Large folder trees or unavailable metadata can limit
+those estimates. Cancel stops a queued or running transfer before publication, and Retry starts
+it again from the beginning. Active transfers are not restored into the UI after an app restart.
 Remote permanent deletion still requires the original confirmation dialog. Local deletion
 uses the Windows Recycle Bin; cancelling Windows' operation must leave the file in place.
 HEIC/AVIF need a codec and are not promised by this port; common PNG/JPEG/GIF/BMP/SVG and

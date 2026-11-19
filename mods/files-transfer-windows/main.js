@@ -11,9 +11,9 @@
 // English/Russian text.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, InputState, Input } from "gpui-base";
-import { spaces, panes, focused, run, exec, readTextFile, watchFolder, theme, settings, window, props, openOverlay, closeOverlay, shared, setShared, notify, hc, appHome, home, checking } from "herdr";
+import { spaces, panes, focused, run, exec, readTextFile, watchFolder, theme, settings, window, props, openOverlay, closeOverlay, shared, setShared, notify, hc, appHome, home, checking, pickFolder, layout } from "herdr";
 import ICONS from "./icons.js";
-import {browserPath,parentPath,joinPath,sortedEntries,modifiedLabel} from "./browser.js";
+import {browserPath,parentPath,joinPath,folderAddress,sortedEntries,modifiedLabel,matchesName,selectRows} from "./browser.js";
 import {win, winResult, normalize, jobPath, isWindowsPath} from "./windows.js";
 const windowsHost = () => window()?.platform === "windows";
 const windowsTarget = (on, path) => on ? isWindowsPath(path) : windowsHost();
@@ -169,12 +169,20 @@ const MAX_IMAGE = 50 * 1024 * 1024;
 const PP_TARGET = "preview-plus.target";
 const PP_MARKDOWN = /\.(md|markdown)$/i;
 const PP_MEDIA = /\.(png|jpe?g|webp|svg|pdf)$/i;
-const bytesText = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+function bytesText(n) {
+  if(!Number.isFinite(n))return "—";
+  if(n<1024)return n+" B";
+  if(n<1048576)return (n/1024).toFixed(1)+" KB";
+  if(n<1073741824)return (n/1048576).toFixed(1)+" MB";
+  return (n/1073741824).toFixed(2)+" GB";
+}
 
 const parentOf = path => {const p=normalize(path),parent=p.slice(0,p.lastIndexOf("/"))||"/";return /^[A-Za-z]:$/.test(parent)?parent+"/":parent;};
 
 // A menu row is [action, label, icon]; null draws a divider.
-const MENU = (target, t = T()) => target.root
+const MENU = (target, t = T()) => target.items?.length>1
+  ? [["download", "Download selected ("+target.items.length+")", "download.svg"]]
+  : target.root
   ? [["paste", t.pasteHere, "paste.svg"], ["copy", t.copyPath, "copy.svg"], null,
      ["new-file", t.newFile, "file-plus.svg"], ["new-folder", t.newFolder, "folder-plus.svg"]]
   : [
@@ -231,23 +239,35 @@ function icon(path, dir, open, dark) {
 
 async function directory(path, on) {
   if(windowsTarget(on,path)) return win("list",{path},on);
-  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ] && [ ! -L "$p" ]; then kind=d; else kind=f; fi; stamp=$(stat -c %Y -- "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null); printf "%s\\0%s\\0%s\\0" "$kind" "$stamp" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
+  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ] && [ ! -L "$p" ]; then kind=d; else kind=f; fi; meta=$(stat -c "%Y %s" -- "$p" 2>/dev/null || stat -f "%m %z" "$p" 2>/dev/null); printf "%s\\0%s\\0%s\\0" "$kind" "$meta" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
   const r = await exec("sh", ["-c", script, "files", path], { on });
   if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
   const fields = r.stdout.split("\0"), out = [];
-  for (let i = 0; i + 2 < fields.length; i += 3) out.push({ name: fields[i + 2], dir: fields[i] === "d",mtime:fields[i+1]!==""&&Number.isFinite(Number(fields[i+1]))?Number(fields[i+1])*1000:null });
+  for (let i=0; i+2<fields.length; i+=3) {
+    const [stamp,size]=fields[i+1].match(/^-?\d+ \d+$/)?fields[i+1].split(" ").map(Number):[null,null];
+    const dir=fields[i]==="d";
+    out.push({name:fields[i+2],dir,mtime:stamp===null?null:stamp*1000,size:dir?null:size});
+  }
   return out;
 }
 
 export default class Files extends View {
   init(_props, cx) {
+    if (props()?.downloadSettings) return;
     if (props()?.ask) return this.initAsk(cx);
     if (props()?.menu || props()?.confirm) { this.at = 0; this.handle = cx.focus_handle(); this.handle.focus(); return; }
     // Which panel a menu choice is for: the one that opened the menu.
     this.me = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     this.jobs = [];
+    this.queueOpen = false;
+    this.search = "";
+    this.selection = new Set();
+    this.anchor = null;
+    this.local = { root: "", entries: [], selection: new Set(), anchor: null, loading: false };
+    this.initBrowserInputs(cx);
+
     this.originKey=key();this.followTerminalEnabled=true;this.pinnedLocation=null;this.history=[];
-    try {const saved=JSON.parse(localStorage.getItem("browser-sort")||"{}");this.sortBy=saved.by==="mtime"?"mtime":"name";this.sortDirection=saved.direction===-1?-1:1;}catch{this.sortBy="name";this.sortDirection=1;}
+    try {const saved=JSON.parse(localStorage.getItem("browser-sort")||"{}");this.sortBy=["mtime","size"].includes(saved.by)?saved.by:"name";this.sortDirection=saved.direction===-1?-1:1;}catch{this.sortBy="name";this.sortDirection=1;}
 
     // ⌘V pastes into the selected row's folder: the panel takes the keyboard when clicked.
     this.keys = cx.focus_handle();
@@ -271,6 +291,183 @@ export default class Files extends View {
     const base=location();
     return {...base,cwd:browserPath(base.cwd)};
   }
+
+  initBrowserInputs(cx) {
+    this.editorsFocused=new Set();
+    const init=(id,placeholder)=>{
+      const input=InputState.new({placeholder});
+      input.on("focus",()=>this.editorsFocused.add(id));
+      input.on("blur",()=>this.editorsFocused.delete(id));
+      return input;
+    };
+    this.pathInput=init("path","Folder path");
+    this.pathInput.on("submit",(_event,cx)=>this.jumpToPath(this.pathInput.value(),cx));
+    this.searchInput=init("search","Find files or *.png");
+    this.searchInput.on("change",(_event,cx)=>{
+      this.search=this.searchInput.value();
+      this.clearSelection();
+      cx.notify();
+    });
+    this.localPathInput=init("local","Local folder path");
+    this.localPathInput.on("submit",(_event,cx)=>{
+      const path=folderAddress(this.localPathInput.value(),true);
+      if(path)this.loadLocal(path,cx);
+      else notify({title:"Enter an absolute Windows folder path",level:"warning"});
+    });
+  }
+
+  jumpToPath(value,cx){
+    const current=this.viewLocation();
+    const path=folderAddress(value,windowsTarget(current.on,current.cwd));
+    if(!path){
+      notify({title:"Enter an absolute folder path on the current machine",level:"warning"});
+      return;
+    }
+    this.keys.focus();
+    if(path===this.root){this.refresh(cx);cx.notify();return;}
+    this.navigate(path,cx);
+  }
+
+  downloadScope(on=this.on){
+    return {on:on??null,project:(on??null)===(this.on??null)?this.repoRoot:null};
+  }
+
+  downloadSettings(){
+    try{return JSON.parse(localStorage.getItem("download-folders-v1")||"{}")||{};}
+    catch{return {};}
+  }
+
+  downloadKey(scope,type){
+    return JSON.stringify([scope.on,type==="project"?scope.project:null]);
+  }
+
+  async downloadDirectory(scope){
+    const prefs=this.downloadSettings();
+    return (scope.project && prefs[this.downloadKey(scope,"project")]) ||
+      prefs[this.downloadKey(scope,"machine")] || await win("downloads");
+  }
+
+  openDownloadSettings(){
+    const scope=this.downloadScope(),prefs=this.downloadSettings();
+    openOverlay({mod:"files-transfer-windows",kind:"dialog",width:460,height:scope.project?258:186,
+      props:{downloadSettings:{from:this.me,scope,project:scope.project?prefs[this.downloadKey(scope,"project")]:null,
+        machine:prefs[this.downloadKey(scope,"machine")]}}});
+  }
+
+  async chooseDownloadFolder(req){
+    const prefs=this.downloadSettings();
+    const key=this.downloadKey(req.scope,req.type);
+    if(req.reset)delete prefs[key];
+    else {
+      const folder=await pickFolder({prompt:"Choose a local download folder"});
+      if(!folder)return;
+      prefs[key]=folder;
+    }
+    localStorage.setItem("download-folders-v1",JSON.stringify(prefs));
+  }
+
+  openTerminal(){
+    if(!this.root||this.error||this.loading)return;
+    const candidates=spaces().filter(space=>(space.machine??null)===(this.on??null));
+    const space=candidates.find(space=>space.active)||candidates[0];
+    if(space){run("tab.new",{space:space.id,folder:this.root});return;}
+    if(this.on){
+      run("space.new",{machine:this.on,folder:this.root});
+      return;
+    }
+    // Asking for a local terminal while the active space is remote needs an explicit machine.
+    run("space.new",{machine:"",folder:this.root});
+  }
+
+  async loadLocal(path,cx){
+    const local=this.local;
+    if(local.loading&&local.loadingPath===path)return;
+    const ticket={};
+    local.ticket=ticket;local.loading=true;local.loadingPath=path;local.error=null;
+    cx.notify();
+    try{
+      const entries=await directory(path,null);
+      if(local.ticket!==ticket)return;
+      if(local.root!==path){local.selection.clear();local.anchor=null;}
+      local.root=path;
+      local.entries=entries.filter(entry=>!TEMP.test(entry.name)).slice(0,PER_FOLDER);
+      local.selection=new Set([...local.selection].filter(name=>local.entries.some(entry=>entry.name===name)));
+      this.localPathInput.set_value(path);
+    }catch(error){
+      if(local.ticket===ticket)local.error=String(error.message??error);
+    }finally{
+      if(local.ticket===ticket){local.loading=false;cx.notify();}
+    }
+  }
+
+  toggleSplit(cx){
+    this.split=!this.split;
+    const find=node=>node?.id==="panel"?node:node?.children?.map(find).find(Boolean);
+    const panel=find(layout());
+    if(!this.split){
+      if(this.panelWidth && panel?.size?.px===this.splitWidth)run("layout.resize",{id:"panel",px:this.panelWidth});
+      this.panelWidth=null;cx.notify();return;
+    }
+    if(panel?.size?.px && panel.size.px<710){
+      this.panelWidth=panel.size.px;
+      this.splitWidth=Math.min(740,panel.max??740);
+      run("layout.resize",{id:"panel",px:this.splitWidth});
+    }
+    if(!this.local.root){
+      const scope=this.downloadScope();
+      cx.spawn(async cx=>{
+        try{
+          const path=browserPath(await this.downloadDirectory(scope));
+          await this.loadLocal(path,cx);
+          if(!this.local.root){
+            const fallback=browserPath(home());
+            if(fallback&&fallback!==path)await this.loadLocal(fallback,cx);
+          }
+        }catch(error){this.local.error=String(error.message??error);cx.notify();}
+      });
+    }
+    cx.notify();
+  }
+
+  clearSelection(){
+    this.selected=null;
+    this.selection.clear();
+    this.anchor=null;
+  }
+
+  visibleEntries(){
+    const entries=(this.entries.get("")??[]).filter(entry=>matchesName(entry.name,this.search));
+    return sortedEntries(entries,this.sortBy,this.sortDirection);
+  }
+
+  selectedEntries(){
+    return this.visibleEntries().filter(entry=>this.selection.has(entry.name));
+  }
+
+  queueDownloads(entries,root,on,cx,destination=null,scope=this.downloadScope(on)){
+    if(!root||!entries.length)return;
+    cx.spawn(async cx=>{
+      try{
+        const dir=windowsHost()?(destination||await this.downloadDirectory(scope)):null;
+        for(const entry of entries){
+          await this.download(joinPath(root,entry.name),entry.name,entry.dir,on,{destination:dir,scope,size:entry.size});
+        }
+        this.queueOpen=windowsHost();
+      }catch(error){notify({title:"Could not queue downloads",body:String(error),level:"error"});}
+      cx.notify();
+    });
+  }
+
+  uploadLocalSelection(cx){
+    const local=this.local,destination=this.root,on=this.on;
+    const paths=local.entries.filter(entry=>local.selection.has(entry.name)).map(entry=>joinPath(local.root,entry.name));
+    if(!paths.length||!destination||this.error||this.loading)return;
+    cx.spawn(async cx=>{
+      try{await this.upload(paths,destination,on);this.queueOpen=true;}
+      catch(error){notify({title:"Could not queue uploads",body:String(error),level:"error"});}
+      cx.notify();
+    });
+  }
   viewKey(){return JSON.stringify({origin:this.followTerminalEnabled===false?null:key(),...this.viewLocation()});}
   navigate(path,cx,remember=true){
     const next=browserPath(path),current=this.viewLocation();
@@ -291,7 +488,7 @@ export default class Files extends View {
     }else this.followTerminal(cx);
   }
   setSort(field,cx){
-    this.sortDirection=this.sortBy===field?-this.sortDirection:field==="mtime"?-1:1;
+    this.sortDirection=this.sortBy===field?-this.sortDirection:field==="name"?1:-1;
     this.sortBy=field;
     localStorage.setItem("browser-sort",JSON.stringify({by:field,direction:this.sortDirection}));cx.notify();
   }
@@ -319,7 +516,7 @@ export default class Files extends View {
     if (context !== this.context) {
       this.folderWatch?.cancel?.();this.folderWatch=null;this.loading=false;
       this.context = context; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set();
-      this.pending = new Set(); this.marks = {}; this.selected = null; this.show(null); this.watched = null; this.error = null; this.limited = false;
+      this.pending = new Set(); this.marks = {}; this.repoRoot = null; this.clearSelection(); this.search = ""; this.searchInput.set_value(""); this.pathInput.set_value(cwd); this.show(null); this.watched = null; this.error = null; this.limited = false;
     }
     if (!cwd || this.loading) return;
     this.loading = true;
@@ -338,7 +535,7 @@ export default class Files extends View {
           }
         }
         if (this.viewKey() !== context) return;
-        this.marks = marks; this.error = null; this.watch(cwd, cx);
+        this.marks = marks; this.repoRoot = top?.code === 0 ? top.stdout.trim() : null; this.error = null; this.watch(cwd, cx);
       } catch (e) { if (this.viewKey() === context) this.error = String(e); }
       finally {if(this.context===context)this.loading=false;cx.notify();}
     });
@@ -480,7 +677,7 @@ export default class Files extends View {
   preview(t) {
     const img = this.img;
     if (img) {
-      const room = { w: Math.max(1,(this.size?.width ?? 360) - 32), h: Math.max(1,(this.size?.height ?? 480) - 42 - 32 - 28 - 34 - 32 - (this.jobs.length ? 30 : 0)) };
+      const room = { w: Math.max(1,(this.size?.width ?? 360)/(this.split?2:1) - 32), h: Math.max(1,(this.size?.height ?? 480) - 42 - 32 - 33 - 34 - 32 - (this.split ? 29 : 0) - (this.queueOpen && this.jobs.length ? 132 : 0)) };
       const k = img.w && img.h ? Math.min(1, room.w / img.w, room.h / img.h) : null;
       const info = [img.w && `${img.w}×${img.h}`, bytesText(img.bytes), k !== null && k < 1 && `${Math.round(k * 100)}%`].filter(Boolean).join(" · ");
       return v_flex().flex_1().min_h(0)
@@ -503,8 +700,11 @@ export default class Files extends View {
 
   // path: inside the shown folder ("" for the folder itself).
   openMenu(path, dir) {
+    const entry=this.visibleEntries().find(item=>item.name===path);
     const target = path
-      ? { path: `${this.root}/${path}`, name: path.split("/").pop(), dir, on: this.on ?? null, from: this.me }
+      ? { path: joinPath(this.root,path), name: path.split("/").pop(), dir, on: this.on ?? null, from: this.me,
+        rootPath:this.root,items:this.selection.has(path)?this.selectedEntries():[entry??{name:path,dir}],
+        scope:this.downloadScope(),destination:this.split?this.local.root:null }
       : { path: this.root, name: this.root.split("/").pop(), dir: true, root: true, on: this.on ?? null, from: this.me };
     openOverlay({ mod: "files-transfer-windows", kind: "popup", width: 250, height: menuHeight(MENU(target)), props: { menu: target } });
   }
@@ -516,6 +716,18 @@ export default class Files extends View {
     this.lastRequest = req.id;
     setShared(REQUEST, null);
     const { action, path, name, dir, on } = req;
+    if(action==="download-settings"){
+      cx.spawn(async cx=>{
+        try{await this.chooseDownloadFolder(req);}
+        catch(error){notify({title:"Could not save download folder",body:String(error),level:"error"});}
+        cx.notify();
+      });
+      return;
+    }
+    if(action==="download"){
+      this.queueDownloads(req.items??[{name,dir}],req.rootPath??parentOf(path),on,cx,req.destination,req.scope);
+      return;
+    }
     if (action === "delete") {
       openOverlay({ mod: "files-transfer-windows", kind: "dialog", width: 420, height: 176, props: { confirm: { path, name, dir, on, from: this.me } } });
       return;
@@ -535,8 +747,6 @@ export default class Files extends View {
           notify({ title: T().pathCopied, body: path, level: "info", timeout: 2500 });
         } else if (action === "reveal") {
           if(windowsHost()) await win("reveal",{path});else await exec("open", ["-R", path]);
-        } else if (action === "download") {
-          await this.download(path, name, dir, on);
         } else if (action === "paste") {
           await this.paste(dir ? path : parentOf(path), on);
         } else if (action === "trash") {
@@ -611,13 +821,15 @@ export default class Files extends View {
     const rel = abs.slice(this.root.length + 1), parts = rel.split("/");
     for (let i = 1; i < parts.length; i++) this.folders.add(parts.slice(0, i).join("/"));
     this.selected = { path: rel, dir };
+    this.selection=new Set([rel]);
+    this.anchor=rel;
   }
 
-  async download(path, name, dir, on) {
+  async download(path, name, dir, on, options = {}) {
     if(windowsHost()) {
-      const status=jobPath();
-      await win("start",{status,kind:"download",source:on?`${await sshTarget(on)}:${path}`:path,remote:!!on,name,destination:await win("downloads")});
-      this.jobs.push({kind:"download",status,name,windows:true});return;
+      const destination=options.destination || await this.downloadDirectory(options.scope ?? this.downloadScope(on));
+      this.enqueue({kind:"download",path,name,isDirectory:dir,on,destination,total:options.size ?? null});
+      return;
     }
     const src = on ? `${await sshTarget(on)}:${path}` : path;
     const status = `${appHome()}/data/files-transfer-windows/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -630,18 +842,11 @@ export default class Files extends View {
   // first, then into place under free names (PLACE), so nothing is overwritten.
   async upload(files, dir, on) {
     if(windowsHost()) {
-      files=files.map(normalize);
-      const names=files.map(p=>p.replace(/\/$/,"").split("/").pop().toLowerCase());
-      if(on&&new Set(names).size!==names.length)throw Error("Upload same-named items separately.");
-      const status=jobPath(),name=files.length===1?names[0]:T().items(files.length);
-      if(!on){await win("start",{status,kind:"upload-local",sources:files,destination:dir});this.jobs.push({kind:"upload",status,name,dir,on,windows:true});return;}
-      const remoteWin=windowsTarget(on,dir);
-      const mk=remoteWin?null:await exec("mktemp",["-d",`${dir}/.herdr-upload.XXXXXX`],{on});
-      if(mk&&mk.code!==0)throw Error(mk.stderr||"Cannot create remote staging folder");
-      const tmp=remoteWin?await win("stage-create",{path:dir},on):mk.stdout.trim();
-      try {await win("start",{status,kind:"upload-remote",sources:files,destination:`${await sshTarget(on)}:${tmp}/`});}
-      catch(e){await this.cleanRemoteStage(tmp,dir,on,remoteWin);throw e;}
-      this.jobs.push({kind:"upload",status,name,tmp,dir,on,remoteWin,windows:true});return;
+      for(const source of files.map(normalize)){
+        this.enqueue({kind:"upload",source,name:source.replace(/\/$/,"").split("/").pop(),dir,on});
+      }
+      this.queueOpen=true;
+      return;
     }
     const mk = await exec("mktemp", ["-d", `${dir}/.herdr-upload.XXXXXX`], { on });
     if (mk.code !== 0) throw new Error((mk.stderr || `exit ${mk.code}`).trim());
@@ -662,28 +867,145 @@ export default class Files extends View {
     if(remoteWin) await win("stage-remove",{path,destination:dir},on).catch(()=>{});
     else if(path&&path.startsWith(dir.replace(/\/$/,"")+"/.herdr-upload."))await exec("rm",["-rf","--",path],{on}).catch(()=>{});
   }
+  enqueue(spec) {
+    const active=this.jobs.filter(job=>!["done","failed","cancelled"].includes(job.state));
+    const recent=this.jobs.filter(job=>["done","failed","cancelled"].includes(job.state)).slice(-30);
+    this.jobs=[...recent,...active,{...spec,state:"queued",windows:true,status:jobPath()}];
+  }
+
+  async startJob(job) {
+    const status=job.status;
+    if(job.kind==="download"){
+      let total=job.total;
+      if(job.on && !Number.isFinite(total)){
+        total=await this.remoteBytes(job.path,job.on,job.isDirectory).catch(()=>null);
+      }
+      const source=job.on?(await sshTarget(job.on))+":"+job.path:job.path;
+      await win("start",{status,kind:"download",source,remote:!!job.on,name:job.name,destination:job.destination,total});
+    } else if(!job.on){
+      await win("start",{status,kind:"upload-local",sources:[job.source],destination:job.dir});
+    } else {
+      const ssh=await sshTarget(job.on);
+      job.remoteWin=windowsTarget(job.on,job.dir);
+      if(job.remoteWin)job.tmp=await win("stage-create",{path:job.dir},job.on);
+      else{
+        const result=await exec("mktemp",["-d",joinPath(job.dir,".herdr-upload.XXXXXX")],{on:job.on});
+        if(result.code!==0)throw Error(result.stderr||"Cannot create remote staging folder");
+        job.tmp=result.stdout.trim();
+      }
+      try{
+        await win("start",{status,kind:"upload-remote",sources:[job.source],destination:ssh+":"+job.tmp+"/"});
+      }catch(error){
+        await this.cleanRemoteStage(job.tmp,job.dir,job.on,job.remoteWin);
+        throw error;
+      }
+    }
+    job.started=Date.now();
+    job.state="running";
+  }
+
+  async remoteBytes(path,on,dir=true){
+    if(windowsTarget(on,path))return win(dir?"tree-bytes":"size",{path},on);
+    // Count payload bytes rather than allocated disk blocks. Cap recursive sampling.
+    const script=dir
+      ? `if [ -d "$1" ]; then
+          if find "$1" -maxdepth 0 -printf "" >/dev/null 2>&1; then
+            find "$1" -type f -printf "%s\\n"
+          else
+            find "$1" -type f -exec stat -f "%z" {} +
+          fi | head -n 5001 | awk 'NR<=5000 { sum += $1 } END { if (NR<=5000) printf "%.0f", sum }'
+        else printf 0; fi`
+      : 'if [ -f "$1" ]; then stat -c "%s" -- "$1" 2>/dev/null || stat -f "%z" "$1"; else printf 0; fi';
+    const result=await exec("sh",["-c",script,"measure",path],{on,timeout:5000});
+    const value=result.stdout?.trim();
+    return result.code===0 && /^\d+$/.test(value)?Number(value):null;
+  }
+
+  async finishJob(job,result,cx) {
+    const cancelled=result.code==="2" || (job.state==="cancelling" && job.kind==="upload" && !!job.on);
+    job.state="finalizing";cx.notify();
+    try {
+      if(cancelled){job.state="cancelled";return;}
+      if(result.code!=="0")throw Error(result.log||"Transfer failed");
+      if(job.kind==="upload" && job.on){
+        if(job.remoteWin)await win("stage-place",{path:job.tmp,destination:job.dir},job.on);
+        else {
+          const placed=await exec("sh",["-c",PLACE,"place",job.tmp,job.dir],{on:job.on});
+          if(placed.code!==0)throw Error(placed.stderr||"Cannot finish upload");
+        }
+      }
+      job.state="done";
+      job.saved=result.dest?.[0];
+      notify({title:job.kind==="download"?T().downloaded(job.name):T().uploaded(job.name),
+        body:job.saved || (job.on?job.on+":"+job.dir:job.dir),level:"success",timeout:5000});
+    }catch(error){
+      job.state="failed";job.error=String(error.message??error);
+    }finally{
+      if(job.tmp)await this.cleanRemoteStage(job.tmp,job.dir,job.on,job.remoteWin);
+      await win("status-clean",{status:job.status}).catch(()=>{});
+      this.refresh(cx);
+      if(this.local.root)this.loadLocal(this.local.root,cx);
+    }
+  }
+
+  cancelJob(job,cx){
+    if(job.state==="queued"){job.state="cancelled";cx.notify();return;}
+    if(job.state!=="running")return;
+    job.state="cancelling";cx.notify();
+    cx.spawn(async cx=>{
+      try{await win("cancel",{status:job.status});}
+      catch(error){
+        if(job.state==="cancelling")job.state="running";
+        notify({title:"Could not cancel transfer",body:String(error),level:"error"});
+      }
+      cx.notify();
+    });
+  }
+
+  retryJob(job,cx){
+    if(job.state!=="failed"&&job.state!=="cancelled")return;
+    const {kind,path,name,isDirectory,on,destination,total,source,dir}=job;
+    this.jobs=this.jobs.filter(item=>item!==job);
+    this.enqueue({kind,path,name,isDirectory,on,destination,total,source,dir});
+    cx.notify();
+  }
+
+  async tickQueue(cx){
+    const active=this.jobs.find(job=>job.windows && ["running","cancelling"].includes(job.state));
+    if(active){
+      const result=await win("status",{status:active.status}).catch(()=>null);
+      if(!result)return;
+      if(result.code!=null){await this.finishJob(active,result,cx);return;}
+      let bytes=result.bytes;
+      if(active.tmp && Date.now()-(active.sampled??0)>2400){
+        bytes=await this.remoteBytes(active.tmp,active.on).catch(()=>null);
+        active.sampled=Date.now();
+      }
+      if(Number.isFinite(bytes))active.bytes=bytes;
+      if(Number.isFinite(result.total))active.total=result.total;
+      cx.notify();
+      return;
+    }
+    const next=this.jobs.find(job=>job.windows && job.state==="queued");
+    if(!next)return;
+    next.state="starting";cx.notify();
+    try{await this.startJob(next);}
+    catch(error){next.state="failed";next.error=String(error.message??error);}
+    cx.notify();
+  }
+
   poll(cx) {
     if (!this.jobs?.length || this.polling) return;
+    if(windowsHost() && !this.jobs.some(job=>["queued","running","cancelling"].includes(job.state)))return;
     this.polling=true;
     cx.spawn(async cx => {
       let changed = false;
-      try { for (const job of [...this.jobs]) {
-        if(job.windows){
-          let result;
-          try {result=await win("status",{status:job.status});}catch {continue;}
-          if(result.code==null)continue;
-          this.jobs=this.jobs.filter(j=>j!==job);changed=true;
-          try {
-            if(result.code!=="0")throw Error(result.log||"Transfer failed");
-            if(job.kind==="upload"&&job.on){
-              if(job.remoteWin)await win("stage-place",{path:job.tmp,destination:job.dir},job.on);
-              else {const r=await exec("sh",["-c",PLACE,"place",job.tmp,job.dir],{on:job.on});if(r.code!==0)throw Error(r.stderr||"Cannot finish upload");}
-            }
-            notify({title:job.kind==="download"?T().downloaded(job.name):T().uploaded(job.name),body:job.on?`${job.on}:${job.dir}`:normalize(result.dest?.[0]||job.dir||""),level:"success",timeout:6000});
-          }catch(e){notify({title:job.kind==="download"?T().downloadFailed(job.name):T().uploadFailed(job.name),body:String(e.message??e),level:"error"});}
-          finally {if(job.tmp)await this.cleanRemoteStage(job.tmp,job.dir,job.on,job.remoteWin);await win("status-clean",{status:job.status}).catch(()=>{});}
-          this.refresh(cx);continue;
+      try {
+        if(windowsHost()){
+          await this.tickQueue(cx);
+          return;
         }
+        for (const job of [...this.jobs]) {
         const code = await readTextFile(job.status).catch(() => null);
         if (code === null) continue;
         this.jobs = this.jobs.filter(j => j !== job);
@@ -825,24 +1147,181 @@ export default class Files extends View {
     this.keys?.focus();
   }
 
-  rows(prefix, depth, out, t, dark) {
-    if (out.length >= TOTAL || depth > 40) return out;
-    for (const entry of sortedEntries(this.entries.get(prefix)??[],this.sortBy,this.sortDirection)) {
-      if (out.length >= TOTAL) break;
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
-      out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
-        .when(this.selected?.path === path, el => el.bg(t.selected)).hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => { this.select(path, entry.dir); entry.dir ? this.navigate(joinPath(this.root,path),cx) : this.handoff(path, cx) || this.show(path, cx); })
-        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.select(path, entry.dir); cx.notify(); this.openMenu(path, entry.dir); })
-        .on_drop((e, cx) => { cx.stop_propagation(); this.drop(e.paths, entry.dir ? path : prefix, cx); })
-        .child(entry.dir ? svg(`${DIR}/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
-        .child(image(icon(path, entry.dir, open, dark)).size(16).flex_none())
-        .child(div().flex_1().min_w(0).truncate().tooltip(entry.name).child(entry.name))
-        .child(div().w(110).flex_none().text_size(10.5).text_color(t.dim).tooltip(Number.isFinite(entry.mtime)?new Date(entry.mtime).toLocaleString():"수정 날짜 없음").child(modifiedLabel(entry.mtime)))
-        .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
+  clickRow(entry,event,cx,orderedNames){
+    const modifiers=event?.modifiers;
+    const range=!!modifiers?.shift,toggle=!!(modifiers?.control||modifiers?.platform);
+    const state=selectRows(this.selection,this.anchor,entry.name,orderedNames,{range,toggle});
+    this.selection=state.selection;this.anchor=state.anchor;
+    const single=this.selection.size===1?this.selectedEntries()[0]:null;
+    this.selected=single?{path:single.name,dir:single.dir}:null;
+    this.keys.focus();
+    if(range||toggle){cx.notify();return;}
+    if(entry.dir)this.navigate(joinPath(this.root,entry.name),cx);
+    else this.handoff(entry.name,cx)||this.show(entry.name,cx);
+  }
 
-    }
-    return out;
+  rows(t,dark,showDate){
+    const entries=this.visibleEntries();
+    const orderedNames=entries.map(entry=>entry.name);
+    return entries.map(entry=>{
+      const path=entry.name,mark=this.marks[joinPath(this.root,path)];
+      const row=h_flex().id("file-"+path).h(28).flex_none().px(8).gap(7).items_center().rounded(7).cursor_pointer()
+        .when(this.selection.has(path),el=>el.bg(t.selected)).hover(style=>style.bg(t.hover))
+        .on_mouse_down("left",(_event,cx)=>cx.stop_propagation())
+        .on_click((event,cx)=>this.clickRow(entry,event,cx,orderedNames))
+        .on_mouse_down("right",(_event,cx)=>{
+          cx.stop_propagation();
+          if(!this.selection.has(path)){
+            this.selection=new Set([path]);this.anchor=path;this.select(path,entry.dir);
+          }
+          cx.notify();this.openMenu(path,entry.dir);
+        })
+        .on_drop((e,cx)=>{cx.stop_propagation();this.drop(e.paths,entry.dir?path:"",cx);})
+        .child(image(icon(path,entry.dir,false,dark)).size(16).flex_none())
+        .child(div().flex_1().min_w(0).truncate().tooltip(entry.name).child(entry.name))
+        .when(Boolean(mark),el=>el.child(div().text_size(10).text_color(t.muted).child(mark)))
+        .child(div().w(62).flex_none().text_size(10.5).text_color(t.dim).child(entry.dir?"—":bytesText(entry.size)));
+      if(showDate)row.child(div().w(104).flex_none().text_size(10.5).text_color(t.dim)
+        .tooltip(Number.isFinite(entry.mtime)?new Date(entry.mtime).toLocaleString():"수정 날짜 없음").child(modifiedLabel(entry.mtime)));
+      return row;
+    });
+  }
+
+  inputBox(state,t){
+    return Input.new(state).w_full().h(25).px(7).rounded(5).border_1()
+      .border_color(t.border).bg(t.background).text_size(11).text_color(t.foreground);
+  }
+
+  sortLabel(field,label){
+    return label+(this.sortBy===field?(this.sortDirection===1?" ↑":" ↓"):"");
+  }
+
+  browserPane(t,dark){
+    const showDate=!this.split || (this.size?.width??740)>650;
+    const selected=this.selectedEntries();
+    const address=this.on
+      ? h_flex().gap(6).items_center()
+          .child(div().max_w(100).truncate().text_size(10).text_color(t.muted).tooltip(this.on).child(this.on))
+          .child(div().flex_1().min_w(0).child(this.inputBox(this.pathInput,t)))
+      : this.inputBox(this.pathInput,t);
+    const pane=v_flex().flex_1().h_full().min_w(0).min_h(0)
+      .when(!!this.split,el=>el.child(h_flex().h(29).flex_none().items_center().px(8).bg(t.surface)
+        .child(div().flex_1().min_w(0).truncate().text_size(11).child(this.on?"Remote · "+this.on:"This PC"))
+        .child(this.navButton("files-split-download","← Download","Send selected files to the left folder",
+          selected.length>0&&!!this.local.root&&!this.local.loading&&!this.error,
+          (_e,cx)=>this.queueDownloads(selected,this.root,this.on,cx,this.local.root),t))))
+      .child(div().px(8).py(4).flex_none().child(address));
+    if(this.file)return pane.child(this.preview(t));
+    return pane
+      .child(h_flex().h(33).flex_none().px(8).gap(5).items_center()
+        .child(div().flex_1().min_w(0).child(this.inputBox(this.searchInput,t)))
+        .when(selected.length>0,el=>el.child(this.navButton("files-selected-download","↓ "+selected.length,
+          this.split?"Download selected to the left folder":"Download selected",!this.split||(!!this.local.root&&!this.local.loading),
+          (_e,cx)=>this.queueDownloads(selected,this.root,this.on,cx,this.split?this.local.root:null),t))))
+      .child(h_flex().h(28).flex_none().px(14).gap(7).items_center().bg(t.surface).text_size(11).text_color(t.muted)
+        .child(div().id("files-sort-name").flex_1().min_w(0).cursor_pointer().on_click((_e,cx)=>this.setSort("name",cx)).child(this.sortLabel("name","이름")))
+        .child(div().id("files-sort-size").w(62).flex_none().cursor_pointer().on_click((_e,cx)=>this.setSort("size",cx)).child(this.sortLabel("size","크기")))
+        .when(showDate,el=>el.child(div().id("files-sort-date").w(104).flex_none().cursor_pointer()
+          .on_click((_e,cx)=>this.setSort("mtime",cx)).child(this.sortLabel("mtime","수정 날짜")))))
+      .child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6)
+        .on_mouse_down("left",(_e,cx)=>{this.clearSelection();this.keys.focus();cx.notify();})
+        .on_mouse_down("right",()=>this.root&&this.openMenu("",true))
+        .on_drop((e,cx)=>this.drop(e.paths,"",cx)).children(this.rows(t,dark,showDate))
+        .when(!!this.error||!this.visibleEntries().length,el=>el.child(div().p(8).text_size(12).text_color(t.dim)
+          .child(this.error||(this.loading?"Loading files…":this.search?"No matching files":this.root?"No files":"No folder"))))
+        .when(this.limited,el=>el.child(div().p(8).text_size(11).text_color(t.dim).child("현재 폴더는 최대 500개까지 표시합니다"))));
+  }
+
+  localPane(t,dark){
+    const local=this.local,entries=sortedEntries(local.entries);
+    const order=entries.map(entry=>entry.name);
+    const canSend=local.selection.size>0&&!!this.root&&!this.loading&&!this.error&&!local.loading;
+    const rows=entries.map(entry=>h_flex().id("local-file-"+entry.name).h(28).px(8).gap(7).items_center().rounded(6)
+      .hover(style=>style.bg(t.hover)).when(local.selection.has(entry.name),el=>el.bg(t.selected))
+      .cursor_pointer().on_click((event,cx)=>{
+        const range=!!event?.modifiers?.shift,toggle=!!event?.modifiers?.control;
+        const next=selectRows(local.selection,local.anchor,entry.name,order,{range,toggle});
+        local.selection=next.selection;local.anchor=next.anchor;
+        if(entry.dir&&!range&&!toggle)this.loadLocal(joinPath(local.root,entry.name),cx);
+        else cx.notify();
+      })
+      .child(image(icon(entry.name,entry.dir,false,dark)).size(16).flex_none())
+      .child(div().flex_1().min_w(0).truncate().tooltip(entry.name).child(entry.name))
+      .child(div().w(62).flex_none().text_size(10.5).text_color(t.dim).child(entry.dir?"—":bytesText(entry.size))));
+    return v_flex().flex_1().h_full().min_w(0).min_h(0).border_r(1).border_color(t.border)
+      .child(h_flex().h(29).flex_none().items_center().px(8).bg(t.surface)
+        .child(div().flex_1().text_size(11).child("Local"))
+        .child(this.navButton("files-split-upload","Upload →","Send selected files to the right folder",canSend,
+          (_e,cx)=>this.uploadLocalSelection(cx),t)))
+      .child(h_flex().gap(4).px(7).py(4).items_center()
+        .child(this.navButton("files-local-up","↑","Local parent folder",!!local.root&&parentPath(local.root)!==local.root,
+          (_e,cx)=>this.loadLocal(parentPath(local.root),cx),t))
+        .child(div().flex_1().min_w(0).child(this.inputBox(this.localPathInput,t))))
+      .child(v_flex().id("files-local-list").flex_1().min_h(0).overflow_y_scrollbar().p(5)
+        .when(!!local.error||local.loading||!entries.length,el=>el.child(div().p(7).text_size(11).text_color(t.dim)
+          .child(local.error||(local.loading?"Loading files…":"No files"))))
+        .children(rows));
+  }
+
+  downloadFolderDialog(t){
+    const settings=props().downloadSettings;
+    const choose=(type,reset)=>{
+      setShared(REQUEST,{id:String(Date.now())+Math.random(),action:"download-settings",from:settings.from,scope:settings.scope,type,reset});
+      closeOverlay(props().overlay);
+    };
+    const button=(id,label,tip,enabled,action)=>this.navButton(id,label,tip,enabled,action,t)
+      .h(28).border_1().border_color(enabled?t.input:t.border).bg(enabled?t.raised:t.popover);
+    const row=(type,title,value,fallback)=>v_flex().w_full().p(8).gap(5).flex_none()
+      .rounded(7).border_1().border_color(t.border).bg(t.surface)
+      .child(div().text_size(11).font_semibold().truncate().tooltip(title).child(title))
+      .child(h_flex().gap(6).items_center()
+        .child(div().flex_1().min_w(0).h(28).px(7).flex().items_center()
+          .rounded(5).border_1().border_color(t.input).bg(t.background)
+          .child(div().min_w(0).truncate().text_size(11).text_color(value?t.foreground:t.muted)
+            .tooltip(value||fallback).child(value||fallback)))
+        .child(button("choose-download-"+type,"Choose","Remember a local folder",true,()=>choose(type,false)))
+        .child(button("reset-download-"+type,"Reset","Use the fallback folder",!!value,()=>choose(type,true))));
+    return v_flex().size_full().p(13).gap(8).bg(t.popover).text_color(t.foreground)
+      .child(div().font_semibold().child("Download folders"))
+      .child(row("machine","Machine · "+(settings.scope.on||"This PC"),settings.machine,"Default Downloads"))
+      .when(!!settings.scope.project,el=>el.child(row("project","Project · "+settings.scope.project,settings.project,"Use machine folder")))
+      .child(h_flex().gap(6).items_center().justify_end()
+        .when(!!settings.scope.project,el=>el.child(div().flex_1().min_w(0).h(28).px(7).flex().items_center()
+          .rounded(5).border_1().border_color(t.border).bg(t.surface)
+          .child(div().truncate().text_size(10).text_color(t.muted).child("Project folder takes priority."))))
+        .child(button("download-folders-close","Close","Close",true,()=>closeOverlay(props().overlay))));
+  }
+
+  queuePanel(t){
+    if(!this.queueOpen||!this.jobs.length)return div().h(0).flex_none();
+    const elapsed=job=>Math.max(1,(Date.now()-(job.started??Date.now()))/1000);
+    const progress=job=>{
+      const bytes=job.bytes,total=job.total;
+      if(!Number.isFinite(bytes))return "Measuring transfer…";
+      if(!(total>0))return bytesText(bytes);
+      const rate=bytes/elapsed(job);
+      const left=rate>0&&total>bytes?Math.ceil((total-bytes)/rate):0;
+      return bytesText(bytes)+" / "+bytesText(total)+" · "+Math.min(99,Math.floor(100*bytes/total))+"%"
+        +(left>0?" · ~"+(left<60?left+"s":Math.ceil(left/60)+"m"):"");
+    };
+    const rows=this.jobs.map(job=>{
+      const state=job.state==="running"?progress(job):job.state==="failed"?job.error:job.state;
+      const target=job.kind==="download"?job.saved||job.destination:(job.on?job.on+":":"")+job.dir;
+      return h_flex().id("job-"+job.status).flex_none().gap(6).items_center().px(8).py(4)
+        .child(v_flex().flex_1().min_w(0).gap(2)
+          .child(div().truncate().text_size(11).tooltip(target||"").child((job.kind==="download"?"↓ ":"↑ ")+job.name))
+          .child(div().truncate().text_size(10).text_color(job.state==="failed"?t.ansi1:t.muted).tooltip(state||"").child(state||"")))
+        .when(["queued","running"].includes(job.state),el=>el.child(this.navButton("cancel-"+job.status,"Cancel","Cancel transfer",true,
+          (_e,cx)=>this.cancelJob(job,cx),t)))
+        .when(["failed","cancelled"].includes(job.state),el=>el.child(this.navButton("retry-"+job.status,"Retry","Queue this transfer again",true,
+          (_e,cx)=>this.retryJob(job,cx),t)));
+    });
+    return v_flex().h(132).flex_none().min_h(0).border_t(1).border_color(t.border).bg(t.surface)
+      .child(h_flex().h(26).px(8).items_center()
+        .child(div().flex_1().text_size(11).font_semibold().child("Transfers"))
+        .child(this.navButton("files-queue-clear","Clear finished","Remove completed items",this.jobs.some(job=>job.state==="done"),
+          (_e,cx)=>{this.jobs=this.jobs.filter(job=>job.state!=="done");cx.notify();},t)))
+      .child(v_flex().id("files-queue-list").flex_1().min_h(0).overflow_y_scrollbar().children(rows));
   }
 
   navButton(id,label,tip,enabled,action,t,active=false){
@@ -853,16 +1332,20 @@ export default class Files extends View {
   }
 
   render(cx) {
+    if (props()?.downloadSettings) return this.downloadFolderDialog(theme());
     if (props()?.menu) return this.menu(theme());
     if (props()?.confirm) return this.confirm(theme());
     if (props()?.ask) return this.ask(theme());
     this.take(cx);
     if (!checking() && this.viewKey() !== this.context) this.refresh(cx);
     const t = theme(), dark = Boolean(settings().dark);
+    const canOpenTerminal=!!this.root&&!this.error&&!this.loading;
+    const activeJobs=this.jobs.filter(job=>["queued","starting","running","cancelling","finalizing"].includes(job.state)).length;
     return v_flex().id("files").track_focus(this.keys).size_full().min_h(0)
       .on_key_down((e, cx) => {
+        if(this.editorsFocused.size)return;
         if (e.keystroke === "cmd-v" || (windowsHost() && e.keystroke === "ctrl-v")) { cx.stop_propagation(); this.pasteKey(cx); }
-        else if (e.keystroke === "escape" && this.selected) { cx.stop_propagation(); this.selected = null; cx.notify(); }
+        else if (e.keystroke === "escape" && this.selection.size) { cx.stop_propagation(); this.clearSelection(); cx.notify(); }
       })
       // Sizes arrive in window points; element sizes are given at zoom 1.
       .on_size_change((size, cx) => {
@@ -873,6 +1356,8 @@ export default class Files extends View {
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .child(div().font_semibold().child("Files"))
+        .when(windowsHost(),el=>el.child(this.navButton("files-split","Split","Show local and active folders side by side",true,(_e,cx)=>this.toggleSplit(cx),t,!!this.split))
+          .child(this.navButton("files-queue",activeJobs?"Queue "+activeJobs:"Queue","Show transfers",true,(_e,cx)=>{this.queueOpen=!this.queueOpen;cx.notify();},t,this.queueOpen)))
         .child(h_flex().flex_1().min_w(0).gap(6).justify_end().items_center().text_size(12).text_color(t.dim)
           .when(Boolean(this.file), el => el.child(image(icon(this.file, false, false, dark)).size(14).flex_none()))
           .child(div().min_w(0).truncate().child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
@@ -885,20 +1370,16 @@ export default class Files extends View {
         .child(this.navButton("files-nav-up","↑ 상위","상위 폴더",!!this.root&&parentPath(this.root)!==this.root,(_e,cx)=>this.navigate(parentPath(this.root),cx),t))
         .child(this.navButton("files-nav-terminal","터미널 위치",this.followTerminalEnabled!==false?"ON: 터미널 위치를 따라갑니다. 클릭하면 현재 폴더에 고정합니다.":"OFF: 현재 폴더에 고정되어 있습니다. 클릭하면 터미널 위치로 이동해 다시 따라갑니다.",true,(_e,cx)=>this.toggleTerminalFollow(cx),t,this.followTerminalEnabled!==false))
         .child(div().flex_1())
+        .child(this.navButton("files-open-terminal",svg(DIR+"/terminal.svg").size(16).text_color(canOpenTerminal?t.accent:t.dim),
+          "Open a terminal in this folder",canOpenTerminal,()=>this.openTerminal(),t))
+        .when(windowsHost(),el=>el.child(this.navButton("files-download-settings","↓ Settings","Remember a local download folder",!!this.root,
+          ()=>this.openDownloadSettings(),t)))
         .child(this.navButton("files-nav-refresh","↻","새로고침",!this.loading,(_e,cx)=>{this.refresh(cx);cx.notify();},t)))
-      .child(div().h(28).flex_none().px(12).flex().items_center().text_size(11).text_color(t.muted).truncate()
-        .tooltip(this.on?`${this.on}:${this.root}`:this.root||"").child(this.on?`${this.on}:${this.root||""}`:this.root||"폴더 없음"))
-      .when(!this.file,el=>el.child(h_flex().h(28).flex_none().px(12).gap(7).items_center().bg(t.surface).text_size(11).text_color(t.muted)
-        .child(div().id("files-sort-name").flex_1().min_w(0).cursor_pointer().on_click((_e,cx)=>this.setSort("name",cx)).child(`이름 ${this.sortBy==="name"?(this.sortDirection===1?"↑":"↓"):""}`))
-        .child(div().id("files-sort-date").w(110).flex_none().cursor_pointer().on_click((_e,cx)=>this.setSort("mtime",cx)).child(`수정 날짜 ${this.sortBy==="mtime"?(this.sortDirection===1?"↑":"↓"):""}`))))
-      .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6)
-        .on_mouse_down("left", (_e, cx) => { this.selected = null; this.keys.focus(); cx.notify(); })
-        .on_mouse_down("right", () => this.root && this.openMenu("", true))
-        .on_drop((e, cx) => this.drop(e.paths, "", cx)).children(this.rows("", 0, [], t, dark))
-        .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
-        .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("현재 폴더는 최대 500개까지 표시합니다")))))
-      .when(Boolean(this.file), el => el.child(this.preview(t)))
-      .when(this.jobs.length > 0, el => el.child(h_flex().h(30).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border).text_size(12).text_color(t.muted)
+      .child(h_flex().flex_1().w_full().items_stretch().min_h(0).min_w(0)
+        .when(!!this.split,el=>el.child(this.localPane(t,dark)))
+        .child(this.browserPane(t,dark)))
+      .when(windowsHost()&&this.queueOpen,el=>el.child(this.queuePanel(t)))
+      .when(!windowsHost() && this.jobs.length > 0, el => el.child(h_flex().h(30).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border).text_size(12).text_color(t.muted)
         .child(svg(`${DIR}/spinner.svg`).size(12).flex_none().text_color(t.working).spin(900))
         .child(div().flex_1().min_w(0).truncate().child(this.jobs.length === 1 ? T()[this.jobs[0].kind === "upload" ? "uploading" : "downloading"](this.jobs[0].name) : T().transferring(this.jobs.length)))));
   }

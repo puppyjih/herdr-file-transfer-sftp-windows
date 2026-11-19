@@ -30,3 +30,7 @@ Original copyrights, LICENSE and third-party license files are retained.
 Explorer additions (2026-11-17): folder entry/back/up navigation, terminal-folder reset, refresh toolbar, modification timestamps and persistent name/date ordering.
 
 Follow-mode additions (2026-11-17): default-on terminal tracking, explicit ON/OFF toolbar state, manual-navigation pinning of folder and machine, and tracking resumption.
+
+Files workflow additions: editable folder paths, name filters, file sizes, multi-selection,
+opening a terminal from Files, local/remote split view, and Windows transfer progress,
+cancellation, retry and saved download destinations.

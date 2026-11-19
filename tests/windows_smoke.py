@@ -39,6 +39,7 @@ def main():
         assert len(rows) == 2
         stamp = next(row["mtime"] for row in rows if row["name"] == name)
         assert abs(stamp - file.stat().st_mtime * 1000) < 1000
+        assert next(row["size"] for row in rows if row["name"] == name) == file.stat().st_size
         fresh = destination / "new.txt"
         call("new-file", path=str(fresh))
         try:
@@ -73,6 +74,24 @@ def main():
         assert (destination / name.replace(".txt", " (2).txt")).exists()
         assert not list(destination.glob(".herdr-*"))
 
+        # Poll a real staging file, then cancel its job before publication.
+        status = app / "data/files-transfer-windows/win-cancel-test"
+        request_file = status.with_suffix(".request.json")
+        progress_file = status.with_suffix(".progress")
+        request_file.write_text(json.dumps({
+            "appHome": str(app), "status": str(status), "kind": "download",
+            "source": str(file), "destination": str(destination), "name": "cancelled.txt",
+        }), encoding="utf-8")
+        progress_file.write_text(json.dumps({"path": str(file), "total": 100}), encoding="utf-8")
+        progress = call("status", appHome=str(app), status=str(status))
+        assert progress == {"code": None, "bytes": file.stat().st_size, "total": 100}, progress
+        call("cancel", appHome=str(app), status=str(status))
+        call("worker-file", requestFile=str(request_file))
+        assert call("status", appHome=str(app), status=str(status))["code"] == "2"
+        assert not (destination / "cancelled.txt").exists()
+        call("status-clean", appHome=str(app), status=str(status))
+        assert not list(status.parent.glob("win-cancel-test*"))
+
         stage = call("stage-create", path=str(destination))
         (Path(stage) / name).write_text("remote")
         assert call("stage-place", path=stage, destination=str(destination)) == [name.replace(".txt", " (3).txt")]
@@ -104,7 +123,9 @@ def main():
         remote_stage = remote_call("stage-create", path=str(destination))
         (Path(remote_stage) / "from remote.txt").write_text("remote")
         assert remote_call("stage-place", path=remote_stage, destination=str(destination)) == ["from remote.txt"]
-        assert isinstance(remote_call("list", path=str(destination)), list)
+        remote_rows = remote_call("list", path=str(destination))
+        assert next(row["size"] for row in remote_rows if row["name"] == "from remote.txt") == 6
+        assert remote_call("tree-bytes", path=str(destination)) > 6
         print("PASS: Unicode, brackets, quotes, create/rename, overwrite rejection, detached transfers, duplicate names, dotfiles, remote-Windows finalization, staging boundaries")
 
 
