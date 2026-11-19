@@ -477,7 +477,22 @@ export default class Files extends View {
     this.followTerminalEnabled=false;this.pinnedLocation={cwd:next,on:current.on};
     this.refresh(cx);cx.notify();
   }
-  goBack(cx){const path=this.history.pop();if(path)this.navigate(path,cx,false);}
+  closePreview(cx){
+    if(!this.file)return false;
+    this.show(null);
+    cx.notify();
+    return true;
+  }
+  goBack(cx){
+    if(this.closePreview(cx))return;
+    const path=this.history.pop();
+    if(path)this.navigate(path,cx,false);
+  }
+  goUp(cx){
+    if(this.closePreview(cx)||!this.root)return;
+    const parent=parentPath(this.root);
+    if(parent!==this.root)this.navigate(parent,cx);
+  }
   followTerminal(cx){
     this.originKey=key();this.followTerminalEnabled=true;this.pinnedLocation=null;this.history=[];
     this.show(null);this.selected=null;this.refresh(cx);cx.notify();
@@ -1340,6 +1355,7 @@ export default class Files extends View {
     if (!checking() && this.viewKey() !== this.context) this.refresh(cx);
     const t = theme(), dark = Boolean(settings().dark);
     const canOpenTerminal=!!this.root&&!this.error&&!this.loading;
+    const previewOpen=Boolean(this.file);
     const activeJobs=this.jobs.filter(job=>["queued","starting","running","cancelling","finalizing"].includes(job.state)).length;
     return v_flex().id("files").track_focus(this.keys).size_full().min_h(0)
       .on_key_down((e, cx) => {
@@ -1354,7 +1370,8 @@ export default class Files extends View {
       })
       .rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
+        .when(previewOpen, el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted)
+          .tooltip("미리보기 닫기").on_click((_e,cx)=>this.closePreview(cx)).child("←")))
         .child(div().font_semibold().child("Files"))
         .when(windowsHost(),el=>el.child(this.navButton("files-split","Split","Show local and active folders side by side",true,(_e,cx)=>this.toggleSplit(cx),t,!!this.split))
           .child(this.navButton("files-queue",activeJobs?"Queue "+activeJobs:"Queue","Show transfers",true,(_e,cx)=>{this.queueOpen=!this.queueOpen;cx.notify();},t,this.queueOpen)))
@@ -1366,8 +1383,10 @@ export default class Files extends View {
             .on_click((_e, cx) => { this.source = !this.source; cx.notify(); })
             .child(this.source ? T().preview : T().source)))))
       .child(h_flex().h(32).flex_none().px(8).gap(4).items_center().border_b(1).border_color(t.border)
-        .child(this.navButton("files-nav-back","←", "뒤로",this.history.length>0,(_e,cx)=>this.goBack(cx),t))
-        .child(this.navButton("files-nav-up","↑ 상위","상위 폴더",!!this.root&&parentPath(this.root)!==this.root,(_e,cx)=>this.navigate(parentPath(this.root),cx),t))
+        .child(this.navButton("files-nav-back","←",previewOpen?"미리보기 닫기":"뒤로",previewOpen||this.history.length>0,
+          (_e,cx)=>this.goBack(cx),t))
+        .child(this.navButton("files-nav-up","↑ 상위",previewOpen?"미리보기 닫기":"상위 폴더",previewOpen||(!!this.root&&parentPath(this.root)!==this.root),
+          (_e,cx)=>this.goUp(cx),t))
         .child(this.navButton("files-nav-terminal","터미널 위치",this.followTerminalEnabled!==false?"ON: 터미널 위치를 따라갑니다. 클릭하면 현재 폴더에 고정합니다.":"OFF: 현재 폴더에 고정되어 있습니다. 클릭하면 터미널 위치로 이동해 다시 따라갑니다.",true,(_e,cx)=>this.toggleTerminalFollow(cx),t,this.followTerminalEnabled!==false))
         .child(div().flex_1())
         .child(this.navButton("files-open-terminal",svg(DIR+"/terminal.svg").size(16).text_color(canOpenTerminal?t.accent:t.dim),
